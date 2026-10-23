@@ -8,45 +8,60 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"sahand-matrix/internal/analyzer"
+	"sahand-matrix/internal/hub"
 	"sahand-matrix/pkg/models"
 )
 
 type tickMsg time.Time
 
+type burstResultMsg struct {
+	report     hub.PingBurstReport
+	targetSeq  uint64
+}
+
 type MatrixModel struct {
-	styles         AppStyles
-	width          int
-	height         int
-	selectedNav    int
-	navItems       []string
-	isPaused       bool
-	rttMillis      int
-	seqCounter     uint64
-	checkpoints    map[models.CheckpointID][]models.PacketEvent
-	incidents      []string
+	styles          AppStyles
+	syncEngine      *hub.SyncEngine
+	width           int
+	height          int
+	selectedNav     int
+	navItems        []string
+	isCalibrating   bool
+	isPaused        bool
+	showAgentModal  bool
+	agentConnected  bool
+	lastBurst       hub.PingBurstReport
+	lockedSeq       uint64
+	seqCounter      uint64
+	checkpoints     map[models.CheckpointID][]models.PacketEvent
+	incidents       []string
 }
 
 func NewMatrixModel() MatrixModel {
+	engine := hub.NewSyncEngine(128)
+	initialReport := engine.Measure5PingBurst("simulate", 48.0)
+
 	m := MatrixModel{
-		styles:      DefaultStyles(),
+		styles:     DefaultStyles(),
+		syncEngine: engine,
 		selectedNav: 0,
 		navItems: []string{
 			"⊞  Dashboard",
 			"☊  Topology Map",
 			"⛨  Checkpoints (6)",
-			"📈 Performance",
+			"🚀 Deploy Agent [D]",
 			"📄 Packet Logs",
 			"⚙  Settings",
 		},
-		isPaused:    false,
-		rttMillis:   48, // Simulated 48ms Remote <-> Iran RTT (24ms one-way offset)
-		seqCounter:  10420,
-		checkpoints: make(map[models.CheckpointID][]models.PacketEvent),
+		agentConnected: true,
+		lastBurst:      initialReport,
+		seqCounter:     10420,
+		checkpoints:    make(map[models.CheckpointID][]models.PacketEvent),
 		incidents: []string{
+			"● 5-Ping Sync Calibrated: Avg 48.0ms (Δ +24.0ms)",
 			"● CP1: TLS 1.3 Reality Handshake Verified",
 			"● CP3: Entropy 7.94 bits/B (Encrypted Tunnel)",
 			"● CP5: Domestic Egress Clean (No SNI Leak)",
-			"● CP1: High Entropy Spike on Port 443",
 		},
 	}
 	m.stepSimulation()
@@ -63,12 +78,22 @@ func tickCmd() tea.Cmd {
 	})
 }
 
+// run5PingCalibrationCmd runs 5 rapid RTT probes asynchronously and returns the averaged offset.
+func (m MatrixModel) run5PingCalibrationCmd(seq uint64) tea.Cmd {
+	return func() tea.Msg {
+		report := m.syncEngine.Measure5PingBurst("simulate", 48.0)
+		return burstResultMsg{
+			report:    report,
+			targetSeq: seq,
+		}
+	}
+}
+
 func (m *MatrixModel) stepSimulation() {
 	m.seqCounter++
 	now := time.Now().UTC()
-	oneWayOffset := time.Duration(m.rttMillis/2) * time.Millisecond
+	oneWayOffset := m.lastBurst.OneWayDelay
 
-	// Simulate the exact same logical packet traversing all 6 checkpoints
 	configs := []struct {
 		cp      models.CheckpointID
 		proto   string
@@ -134,9 +159,17 @@ func (m MatrixModel) Update(msg tea.Msg) (tea.Model, tea.Msg) {
 		switch msg.String() {
 		case "q", "ctrl+c":
 			return m, tea.Quit
+		case "d", "D":
+			m.showAgentModal = !m.showAgentModal
 		case " ":
-			// Toggle Smart Time-Synced Pause (freezes all 6 panes at RTT/2 offset)
-			m.isPaused = !m.isPaused
+			if m.isPaused {
+				m.isPaused = false
+				m.isCalibrating = false
+			} else if !m.isCalibrating {
+				// Trigger 5-ping measurement burst before locking the 6 windows
+				m.isCalibrating = true
+				return m, m.run5PingCalibrationCmd(m.seqCounter)
+			}
 		case "up", "k":
 			if m.selectedNav > 0 {
 				m.selectedNav--
@@ -147,8 +180,20 @@ func (m MatrixModel) Update(msg tea.Msg) (tea.Model, tea.Msg) {
 			}
 		}
 
+	case burstResultMsg:
+		m.isCalibrating = false
+		m.isPaused = true
+		m.lastBurst = msg.report
+		m.lockedSeq = msg.targetSeq
+		avgMs := float64(msg.report.AverageRTT.Microseconds()) / 1000.0
+		offsetMs := float64(msg.report.OneWayDelay.Microseconds()) / 1000.0
+		logEntry := fmt.Sprintf("● 5-Ping Lock: [%.1f, %.1f, %.1f, %.1f, %.1f]ms -> Avg %.1fms (Δ +%.1fms)",
+			msg.report.SamplesMs[0], msg.report.SamplesMs[1], msg.report.SamplesMs[2],
+			msg.report.SamplesMs[3], msg.report.SamplesMs[4], avgMs, offsetMs)
+		m.incidents = append([]string{logEntry}, m.incidents[:3]...)
+
 	case tickMsg:
-		if !m.isPaused {
+		if !m.isPaused && !m.isCalibrating {
 			m.stepSimulation()
 		}
 		return m, tickCmd()
@@ -158,21 +203,27 @@ func (m MatrixModel) Update(msg tea.Msg) (tea.Model, tea.Msg) {
 }
 
 func (m MatrixModel) View() string {
+	avgMs := float64(m.lastBurst.AverageRTT.Microseconds()) / 1000.0
+	offsetMs := float64(m.lastBurst.OneWayDelay.Microseconds()) / 1000.0
+
 	// 1. Top Header Bar
-	statusText := m.styles.StatusBadge.Render("GLOBAL STATUS: OPTIMAL ●")
-	if m.isPaused {
+	statusText := m.styles.StatusBadge.Render("GLOBAL STATUS: 6/6 CHECKPOINTS VERIFIED ●")
+	if m.isCalibrating {
+		statusText = m.styles.BadgeWarning.Render("⚡ RUNNING 5-PING BURST CALIBRATION BETWEEN SERVERS...")
+	} else if m.isPaused {
 		statusText = m.styles.BadgeWarning.Render(
-			fmt.Sprintf("⏸ SMART PAUSE ACTIVE (LOCKED @ SEQ #%d | OFFSET +%dms)", m.seqCounter, m.rttMillis/2),
+			fmt.Sprintf("⏸ 5-PING SYNC LOCKED @ SEQ #%d | AVG RTT: %.1fms | WINDOW OFFSET: +%.1fms",
+				m.lockedSeq, avgMs, offsetMs),
 		)
 	}
 
-	headerLeft := m.styles.BrandTitle.Render("🕸  SAHAND MATRIX ") + m.styles.TextMuted.Render("PRO // DPI ANALYZER")
-	header := m.styles.HeaderBar.Width(max(110, m.width-2)).Render(
+	headerLeft := m.styles.BrandTitle.Render("🕸  SAHAND MATRIX ") + m.styles.TextMuted.Render("PRO // 6-CHECKPOINT ANALYZER")
+	header := m.styles.HeaderBar.Width(max(114, m.width-2)).Render(
 		lipgloss.JoinHorizontal(lipgloss.Center,
 			headerLeft,
-			strings.Repeat(" ", max(4, 52-lipgloss.Width(headerLeft))),
+			"    ",
 			statusText,
-			"   [SPACE] Sync-Pause  [Q] Quit",
+			"    [SPACE] 5-Ping Pause  [D] Deploy Agent  [Q] Quit",
 		),
 	)
 
@@ -187,17 +238,43 @@ func (m MatrixModel) View() string {
 		navRows = append(navRows, "")
 	}
 	navRows = append(navRows, strings.Repeat("─", 18))
-	navRows = append(navRows, m.styles.TextMuted.Render("System Status: OK"))
+	navRows = append(navRows, m.styles.BadgeOptimal.Render("● Remote Agent: OK"))
+	navRows = append(navRows, m.styles.BadgeOptimal.Render("● Iran Agent:   OK"))
 	sidebar := m.styles.Sidebar.Height(28).Render(strings.Join(navRows, "\n"))
 
-	// 3. Center 6-Checkpoint Synchronized Grid (2 rows x 3 columns)
+	// If User Pressed [D], Render In-Panel Agent Deployment & Verification View
+	if m.showAgentModal {
+		modalLines := []string{
+			m.styles.CardTitle.Render("🚀 DEPLOY & VERIFY LIGHTWEIGHT SAHAND-AGENT"),
+			"",
+			m.styles.CyanText.Render("1. Fast Install on Remote or Iran Server (Ubuntu Terminal):"),
+			"   bash <(curl -Ls https://raw.githubusercontent.com/<USER>/sahand-matrix/main/scripts/setup.sh)",
+			"",
+			m.styles.PurpleText.Render("2. Direct Manual Agent Launch Command:"),
+			"   sahand-agent --hub <HUB_IP>:8443 --token <AGENT_TOKEN> --role iran",
+			"",
+			m.styles.CardTitle.Render("3. Live 5-Ping Calibration & 6-Window Health Check:"),
+			fmt.Sprintf("   • 5-Ping Samples (ms) : %.2fms | %.2fms | %.2fms | %.2fms | %.2fms",
+				m.lastBurst.SamplesMs[0], m.lastBurst.SamplesMs[1], m.lastBurst.SamplesMs[2],
+				m.lastBurst.SamplesMs[3], m.lastBurst.SamplesMs[4]),
+			fmt.Sprintf("   • Calculated Mean RTT : %.2f ms (Jitter: ±%.2f ms)", avgMs, m.lastBurst.JitterMs),
+			fmt.Sprintf("   • Applied Sync Offset : +%.2f ms (RTT / 2 applied to Checkpoints 4-6)", offsetMs),
+			"   • Checkpoint Status   : CP1 [OK] | CP2 [OK] | CP3 [OK] | CP4 [OK] | CP5 [OK] | CP6 [OK]",
+			"",
+			m.styles.BadgeOptimal.Render("Press [D] to return to the 6-Checkpoint Live Matrix"),
+		}
+		modalBox := m.styles.CardActive.Width(98).Height(20).Render(strings.Join(modalLines, "\n"))
+		return lipgloss.JoinVertical(lipgloss.Left, header, lipgloss.JoinHorizontal(lipgloss.Top, sidebar, "  ", modalBox))
+	}
+
+	// 3. Center 6-Checkpoint Synchronized Grid
 	cpTitles := map[models.CheckpointID]string{
-		models.CP1_RemoteEdgeIngress:   "CP1: Edge Raw Ingress (Remote)",
-		models.CP2_RemoteDecrypted:     "CP2: Decrypted Core (Remote)",
-		models.CP3_InternationalFlight: "CP3: Int'l Transit (In-Flight)",
-		models.CP4_IranInternalIngress: "CP4: Internal Ingress (Iran)",
-		models.CP5_IranEgressEdge:      "CP5: Egress Edge (Iran DPI)",
-		models.CP6_IranAppOutput:       "CP6: App Output (Iran Local)",
+		models.CP1_RemoteEdgeIngress:   "CP1: Edge Ingress (Remote +0ms)",
+		models.CP2_RemoteDecrypted:     "CP2: Decrypted Core (Remote +0ms)",
+		models.CP3_InternationalFlight: fmt.Sprintf("CP3: Int'l Transit (+%.1fms)", offsetMs/2),
+		models.CP4_IranInternalIngress: fmt.Sprintf("CP4: Iran Ingress (+%.1fms)", offsetMs),
+		models.CP5_IranEgressEdge:      fmt.Sprintf("CP5: Iran Egress DPI (+%.1fms)", offsetMs),
+		models.CP6_IranAppOutput:       fmt.Sprintf("CP6: App Output (+%.1fms)", offsetMs),
 	}
 
 	renderCPBox := func(cp models.CheckpointID, isRemote bool) string {
@@ -225,7 +302,7 @@ func (m MatrixModel) View() string {
 		if m.isPaused {
 			cardStyle = m.styles.CardActive
 		}
-		return cardStyle.Width(32).Height(7).Render(strings.Join(lines, "\n"))
+		return cardStyle.Width(33).Height(7).Render(strings.Join(lines, "\n"))
 	}
 
 	row1 := lipgloss.JoinHorizontal(lipgloss.Top,
@@ -239,20 +316,20 @@ func (m MatrixModel) View() string {
 		renderCPBox(models.CP6_IranAppOutput, false),
 	)
 
-	// 4. Bottom 4 KPI Summary Cards (Matching Netview Pro Layout)
+	// 4. Bottom 4 KPI Summary Cards
 	kpi1 := m.styles.KPICard.Render(
 		m.styles.KPILabel.Render("BANDWIDTH") + "\n" +
 			m.styles.KPIValue.Render("14.5 Gbps") + "\n" +
 			m.styles.BadgeOptimal.Render("+1.2% Synced"),
 	)
 	kpi2 := m.styles.KPICard.Render(
-		m.styles.KPILabel.Render("LATENCY / OFFSET") + "\n" +
-			m.styles.KPIValue.Render(fmt.Sprintf("%d ms (Δ +%dms)", m.rttMillis, m.rttMillis/2)) + "\n" +
-			m.styles.BadgeOptimal.Render("RTT/2 Locked"),
+		m.styles.KPILabel.Render("5-PING AVG / OFFSET") + "\n" +
+			m.styles.KPIValue.Render(fmt.Sprintf("%.1fms (Δ +%.1fms)", avgMs, offsetMs)) + "\n" +
+			m.styles.BadgeOptimal.Render(fmt.Sprintf("Jitter ±%.2fms", m.lastBurst.JitterMs)),
 	)
 	kpi3 := m.styles.KPICard.Render(
 		m.styles.KPILabel.Render("ACTIVE CHECKPOINTS") + "\n" +
-			m.styles.KPIValue.Render("6 / 6 Nodes") + "\n" +
+			m.styles.KPIValue.Render("6 / 6 Verified") + "\n" +
 			m.styles.CyanText.Render("━━━━━━━━━━━━"),
 	)
 	kpi4 := m.styles.KPICard.Render(
@@ -264,25 +341,27 @@ func (m MatrixModel) View() string {
 	kpiRow := lipgloss.JoinHorizontal(lipgloss.Top, kpi1, " ", kpi2, " ", kpi3, " ", kpi4)
 	centerColumn := lipgloss.JoinVertical(lipgloss.Left, row1, "", row2, "", kpiRow)
 
-	// 5. Right Rail (CRITICAL INCIDENTS & TRAFFIC BY PROTOCOL)
-	incLines := []string{m.styles.CardTitle.Render("CRITICAL INCIDENTS"), ""}
+	// 5. Right Rail (5-PING TELEMETRY & PROTOCOL DISTRIBUTION)
+	incLines := []string{m.styles.CardTitle.Render("CRITICAL INCIDENTS & SYNC"), ""}
 	for _, inc := range m.incidents {
-		incLines = append(incLines, inc, m.styles.TextMuted.Render("  Synced Logical Stream"))
+		incLines = append(incLines, inc, m.styles.TextMuted.Render("  Verified across CP1..CP6"))
 	}
-	incidentsCard := m.styles.Card.Width(32).Height(11).Render(strings.Join(incLines, "\n"))
+	incidentsCard := m.styles.Card.Width(34).Height(11).Render(strings.Join(incLines, "\n"))
 
 	protoLines := []string{
-		m.styles.CardTitle.Render("TRAFFIC BY PROTOCOL"),
+		m.styles.CardTitle.Render("5-PING SAMPLES (LAST BURST)"),
+		fmt.Sprintf("P1: %.1fms  P2: %.1fms  P3: %.1fms",
+			m.lastBurst.SamplesMs[0], m.lastBurst.SamplesMs[1], m.lastBurst.SamplesMs[2]),
+		fmt.Sprintf("P4: %.1fms  P5: %.1fms  Avg: %.1fms",
+			m.lastBurst.SamplesMs[3], m.lastBurst.SamplesMs[4], avgMs),
 		"",
 		m.styles.CyanText.Render("REALITY ") + "━━━━━━━━━━━━ 68%",
 		m.styles.PurpleText.Render("VLESS   ") + "━━━━━━       22%",
 		m.styles.CyanText.Render("TLS 1.3 ") + "━━━           8%",
-		m.styles.BadgeOptimal.Render("UDP/DNS ") + "━             2%",
 	}
-	protoCard := m.styles.Card.Width(32).Height(10).Render(strings.Join(protoLines, "\n"))
+	protoCard := m.styles.Card.Width(34).Height(10).Render(strings.Join(protoLines, "\n"))
 	rightColumn := lipgloss.JoinVertical(lipgloss.Left, incidentsCard, "", protoCard)
 
-	// Combine Main Body
 	body := lipgloss.JoinHorizontal(lipgloss.Top, sidebar, "  ", centerColumn, "  ", rightColumn)
 	return lipgloss.JoinVertical(lipgloss.Left, header, body)
 }
