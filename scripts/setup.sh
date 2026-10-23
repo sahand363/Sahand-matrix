@@ -5,7 +5,7 @@ set -e
 # SAHAND TRAFFIC MATRIX - Automated Ubuntu Installer & Node Manager
 # ==============================================================================
 
-REPO_OWNER="${SAHAND_REPO_OWNER:-YOUR_GITHUB_USERNAME}"
+REPO_OWNER="${SAHAND_REPO_OWNER:-sahand363}"
 REPO_NAME="${SAHAND_REPO_NAME:-sahand-matrix}"
 INSTALL_DIR="/opt/sahand-matrix"
 CONFIG_FILE="${INSTALL_DIR}/config.env"
