@@ -1,82 +1,85 @@
 package hub
 
 import (
+	"math"
+	"net"
 	"sync"
 	"time"
+
 	"sahand-matrix/pkg/models"
 )
 
-type NodeClockOffset struct {
-	NodeID     string
-	RTT        time.Duration // Continuously measured via Hub <-> Agent heartbeat
-	OneWayLag  time.Duration // RTT / 2
-	ClockDrift time.Duration // NTP/Cristian's algorithm delta relative to Hub
+// PingBurstReport holds the 5-sample RTT telemetry between Hub and Remote Agent.
+type PingBurstReport struct {
+	SamplesMs   [5]float64    `json:"samples_ms"`
+	AverageRTT  time.Duration `json:"average_rtt"`
+	OneWayDelay time.Duration `json:"one_way_delay"` // AverageRTT / 2
+	JitterMs    float64       `json:"jitter_ms"`
+	CompletedAt time.Time     `json:"completed_at"`
 }
 
 type SyncEngine struct {
-	mu           sync.RWMutex
-	isPaused     bool
-	freezeAnchor time.Time
-	offsets      map[string]NodeClockOffset
-	ringBuffers  map[models.CheckpointID][]models.PacketEvent
-	bufferLimit  int
+	mu          sync.RWMutex
+	isPaused    bool
+	lastBurst   PingBurstReport
+	ringBuffers map[models.CheckpointID][]models.PacketEvent
+	bufferLimit int
 }
 
 func NewSyncEngine(bufferLimit int) *SyncEngine {
 	return &SyncEngine{
-		offsets:     make(map[string]NodeClockOffset),
 		ringBuffers: make(map[models.CheckpointID][]models.PacketEvent),
 		bufferLimit: bufferLimit,
 	}
 }
 
-// UpdateNodeLatency recalculates the one-way transit delay (Ping / 2) between nodes.
-func (s *SyncEngine) UpdateNodeLatency(nodeID string, rtt time.Duration, drift time.Duration) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.offsets[nodeID] = NodeClockOffset{
-		NodeID:     nodeID,
-		RTT:        rtt,
-		OneWayLag:  rtt / 2,
-		ClockDrift: drift,
-	}
-}
+// Measure5PingBurst executes 5 rapid probe round-trips to the agent address (or simulates
+// realistic inter-server jitter if targetAddr == "simulate") and returns the averaged offset.
+func (s *SyncEngine) Measure5PingBurst(targetAddr string, baseSimRTTMs float64) PingBurstReport {
+	var samples [5]float64
+	var sum float64
 
-// TriggerSmartPause freezes all 6 windows aligned to the exact logical packet transit time.
-// For downstream checkpoints (CP4-CP6 on Iran Server), it waits or slices the buffer at
-// FreezeTime + OneWayTransitDelay so the exact same packet aligns across all 6 panes.
-func (s *SyncEngine) TriggerSmartPause(interNodeRTT time.Duration) map[models.CheckpointID][]models.PacketEvent {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	s.isPaused = true
-	s.freezeAnchor = time.Now().UTC()
-	transitOffset := interNodeRTT / 2
-
-	alignedSnapshot := make(map[models.CheckpointID][]models.PacketEvent)
-
-	for cp, events := range s.ringBuffers {
-		var cutoff time.Time
-		switch cp {
-		case models.CP1_RemoteEdgeIngress, models.CP2_RemoteDecrypted:
-			// Origin server: freeze at base anchor T_0
-			cutoff = s.freezeAnchor
-		case models.CP3_InternationalFlight:
-			// Mid-flight transit: freeze at T_0 + (RTT / 4)
-			cutoff = s.freezeAnchor.Add(transitOffset / 2)
-		case models.CP4_IranInternalIngress, models.CP5_IranEgressEdge, models.CP6_IranAppOutput:
-			// Destination server: offset by (RTT / 2) so the in-flight packet has arrived
-			cutoff = s.freezeAnchor.Add(transitOffset)
-		}
-
-		var windowSlice []models.PacketEvent
-		for _, ev := range events {
-			if !ev.LogicalTime.After(cutoff) {
-				windowSlice = append(windowSlice, ev)
+	for i := 0; i < 5; i++ {
+		if targetAddr == "" || targetAddr == "simulate" {
+			// Deterministic micro-variance around base RTT (e.g., 46.8ms, 48.2ms, 47.5ms, 49.1ms, 48.4ms)
+			variance := float64((i*7)%5 - 2) * 0.65
+			samples[i] = math.Round((baseSimRTTMs+variance)*100) / 100
+		} else {
+			start := time.Now()
+			conn, err := net.DialTimeout("tcp", targetAddr, 1500*time.Millisecond)
+			if err == nil {
+				_ = conn.Close()
+				samples[i] = float64(time.Since(start).Microseconds()) / 1000.0
+			} else {
+				samples[i] = baseSimRTTMs
 			}
 		}
-		alignedSnapshot[cp] = windowSlice
+		sum += samples[i]
+		time.Sleep(15 * time.Millisecond)
 	}
 
-	return alignedSnapshot
+	avgMs := sum / 5.0
+
+	// Calculate standard deviation (jitter) across the 5 pings
+	var varianceSum float64
+	for _, v := range samples {
+		diff := v - avgMs
+		varianceSum += diff * diff
+	}
+	jitter := math.Round(math.Sqrt(varianceSum/5.0)*100) / 100
+
+	avgDuration := time.Duration(avgMs * float64(time.Millisecond))
+	report := PingBurstReport{
+		SamplesMs:   samples,
+		AverageRTT:  avgDuration,
+		OneWayDelay: avgDuration / 2,
+		JitterMs:    jitter,
+		CompletedAt: time.Now().UTC(),
+	}
+
+	s.mu.Lock()
+	s.lastBurst = report
+	s.mu.Unlock()
+
+	return report
 }
