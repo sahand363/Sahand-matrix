@@ -149,7 +149,7 @@ func simulatedInnerPayload(seed uint64) []byte {
 	return []byte(fmt.Sprintf("GET /api/v2/stream?seq=%d HTTP/1.1\r\nHost: internal.service\r\n\r\n", seed))
 }
 
-func (m MatrixModel) Update(msg tea.Msg) (tea.Model, tea.Msg) {
+func (m MatrixModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
