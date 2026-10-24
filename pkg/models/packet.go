@@ -1,31 +1,36 @@
 package models
 
-import (
-	"time"
-)
+import "time"
 
-// CheckpointID strictly defines the 6 logical observation stages.
 type CheckpointID uint8
 
 const (
-	CP1_RemoteEdgeIngress   CheckpointID = 1 // Raw NIC arrival on Remote Server (Pre-decryption)
-	CP2_RemoteDecrypted     CheckpointID = 2 // Post-X-UI/Reality core decryption on Remote Server
-	CP3_InternationalFlight CheckpointID = 3 // In-flight transit envelope between Remote & Iran
-	CP4_IranInternalIngress CheckpointID = 4 // Raw arrival at Iran Server interface
-	CP5_IranEgressEdge      CheckpointID = 5 // Outbound domestic interface (Leak/DPI inspection point)
-	CP6_IranAppOutput       CheckpointID = 6 // Final payload delivered to local target service
+	CP1_RemoteEdgeIngress   CheckpointID = 1 // Remote Server NIC (Visible to Int'l Edge DPI)
+	CP2_RemoteDecrypted     CheckpointID = 2 // Remote Server Core (Invisible - Inside Server)
+	CP3_InternationalFlight CheckpointID = 3 // Cross-Border Transit (Visible to Transit/GCI DPI)
+	CP4_IranInternalIngress CheckpointID = 4 // Iran Server Arrival (Visible to Domestic Ingress DPI)
+	CP5_IranEgressEdge      CheckpointID = 5 // Iran Server Domestic NIC (CRITICAL: Iran Domestic DPI)
+	CP6_IranAppOutput       CheckpointID = 6 // Final App Payload (Invisible - Inside Server)
 )
 
-// RiskLevel mirrors the visual status indicators (Green, Orange, Red) from the UI design.
 type RiskLevel string
 
 const (
-	RiskOptimal  RiskLevel = "OPTIMAL"  // Emerald Green (#10B981)
-	RiskWarning  RiskLevel = "WARNING"  // Amber Orange (#F59E0B)
-	RiskCritical RiskLevel = "CRITICAL" // Crimson Red (#EF4444)
+	RiskOptimal  RiskLevel = "OPTIMAL"  // Green: Safe
+	RiskWarning  RiskLevel = "WARNING"  // Amber: Suspicious
+	RiskCritical RiskLevel = "CRITICAL" // Red: Blocked by DPI
 )
 
-// TLSMetadata stores unencrypted handshake artifacts visible to passive DPI.
+type TunnelType string
+
+const (
+	TunnelWSS         TunnelType = "wss"         // VMess/VLESS over WSS (WS + TLS 1.3)
+	TunnelReality     TunnelType = "reality"     // VLESS + XTLS-Reality
+	TunnelShadowsocks TunnelType = "shadowsocks" // Shadowsocks-2022 AEAD
+	TunnelGRPC        TunnelType = "grpc"        // HTTP/2 gRPC + TLS
+	TunnelRawTCP      TunnelType = "raw_tcp"     // Unmasked Raw TCP (Triggers Red DPI Alert)
+)
+
 type TLSMetadata struct {
 	IsTLS            bool     `json:"is_tls"`
 	Version          uint16   `json:"version"`
@@ -35,24 +40,30 @@ type TLSMetadata struct {
 	IsRealityMimicry bool     `json:"is_reality_mimicry"`
 }
 
-// DPIAssessment holds the calculated vulnerability metrics for a single packet or burst.
 type DPIAssessment struct {
-	ShannonEntropy float64   `json:"shannon_entropy"` // 0.000 to 8.000 bits/byte
-	RiskScore      int       `json:"risk_score"`      // 0 to 100
+	ShannonEntropy float64   `json:"shannon_entropy"` // 0.00 to 8.00 bits/byte
+	StealthScore   int       `json:"stealth_score"`   // 0% to 100% stealth
+	RiskScore      int       `json:"risk_score"`      // 0 to 100 danger
 	Level          RiskLevel `json:"level"`
-	Triggers       []string  `json:"triggers,omitempty"` // e.g., ["HIGH_ENTROPY_NON_TLS", "SNI_MISMATCH"]
+	Triggers       []string  `json:"triggers,omitempty"`
+	Explanation    string    `json:"explanation"` // Plain-English explanation of what DPI sees
 }
 
-// PacketEvent is the fundamental unit streamed from Agents to the Hub.
 type PacketEvent struct {
-	FlowID        string        `json:"flow_id"`        // Deterministic hash or 5-tuple + correlation tag
-	SequenceNum   uint64        `json:"sequence_num"`   // Logical packet order within the flow
-	Checkpoint    CheckpointID  `json:"checkpoint"`     // 1 through 6
-	TimestampNano int64         `json:"timestamp_nano"` // Local capture monotonic-adjusted UTC timestamp
-	LogicalTime   time.Time     `json:"logical_time"`   // Normalized by Hub using (Ping / 2) offset
+	FlowID        string        `json:"flow_id"`
+	SequenceNum   uint64        `json:"sequence_num"`
+	Checkpoint    CheckpointID  `json:"checkpoint"`
+	CheckpointTitle string      `json:"checkpoint_title"`
+	NodeName      string        `json:"node_name"`
+	DPIVisible    bool          `json:"dpi_visible"` // True if DPI has physical access here
+	DPIZone       string        `json:"dpi_zone"`    // e.g. "IRAN DOMESTIC DPI (TCI/MCI)"
+	TimestampNano int64         `json:"timestamp_nano"`
+	LogicalTime   time.Time     `json:"logical_time"`
+	OffsetMs      float64       `json:"offset_ms"`
 	Length        uint32        `json:"length"`
-	Protocol      string        `json:"protocol"`       // TCP, UDP, TLSv1.3, VLESS, etc.
-	PayloadSample []byte        `json:"payload_sample"` // First N bytes for hex/ASCII TUI inspection
+	Protocol      string        `json:"protocol"`
+	PayloadSample []byte        `json:"payload_sample"`
+	RawByteLog    string        `json:"raw_byte_log"` // e.g. "[!] Raw Data: b'\x17\x03\x03...'"
 	TLS           TLSMetadata   `json:"tls"`
 	DPI           DPIAssessment `json:"dpi"`
 }
