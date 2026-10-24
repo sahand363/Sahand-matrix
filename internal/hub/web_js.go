@@ -6,7 +6,7 @@ let selectedTag = '';
 let lastData = null;
 let lastNodeKey = '';
 let domInitialized = false;
-const scrollLocks = {}; // cpID -> timestamp (ms) when 20s lock expires
+const scrollLocks = {};
 
 function showTab(t) {
   document.getElementById('viewMatrix').style.display = t === 'matrix' ? 'block' : 'none';
@@ -20,10 +20,11 @@ function selectTag(tag) {
   if (lastData) renderMatrix(lastData);
 }
 
-function copyRaw(ev, txt) {
+function copyLine(ev) {
   ev.stopPropagation();
-  navigator.clipboard.writeText(txt);
   const btn = ev.target;
+  const lineText = btn.parentElement.innerText.replace('📋 Copy', '').replace('✓ Copied', '').trim();
+  navigator.clipboard.writeText(lineText);
   btn.innerText = '✓ Copied';
   setTimeout(() => { btn.innerText = '📋 Copy'; }, 1200);
 }
@@ -49,7 +50,7 @@ function onBoxScroll(cpId) {
   if (atBottom) {
     delete scrollLocks[cpId];
   } else {
-    scrollLocks[cpId] = Date.now() + 20000; // 20-second scroll lock
+    scrollLocks[cpId] = Date.now() + 20000;
   }
   updateScrollBadge(cpId);
 }
@@ -176,9 +177,8 @@ function renderMatrix(d) {
     box.innerHTML = evs.length ? evs.map(e => {
       const sp = splitPort(e.src_addr)[1], dp = splitPort(e.dst_addr)[1];
       const cls = (e.dpi.level === 'CRITICAL' ? 'crit' : (e.dpi.level === 'WARNING' ? 'warn' : '')) + (selectedTag && e.correlation_tag === selectedTag ? ' matched' : '');
-      const cleanRaw = e.raw_byte_log.replace(/'/g, "\\'");
       return '<div class="raw-line ' + cls + '" onclick="selectTag(\'' + e.correlation_tag + '\')">' +
-        '<button class="copy-btn" onclick="copyRaw(event, \'' + cleanRaw + '\')">📋 Copy</button>' +
+        '<button class="copy-btn" onclick="copyLine(event)">📋 Copy</button>' +
         '<span class="corr-tag">[' + e.correlation_tag + ']</span>' +
         '<span class="port-tag">Port ' + sp + '➔' + dp + '</span>' +
         '[#' + e.sequence_num + ' ' + e.src_addr + '➔' + e.dst_addr + ' | ' + e.length + 'B] ' + e.raw_byte_log.replace(/</g,'&lt;') + '</div>';
