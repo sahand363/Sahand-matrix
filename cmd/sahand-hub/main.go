@@ -20,15 +20,15 @@ import (
 )
 
 type HubCoordinator struct {
-	mu          sync.RWMutex
-	localSniff  *agent.RealSniffer
-	syncEngine  *hub.SyncEngine
-	nodeMgr     *hub.NodeManager
-	activeS1    string
-	activeS2    string
-	lastPing    hub.PingBurstReport
-	token       string
-	httpClient  *http.Client
+	mu         sync.RWMutex
+	localSniff *agent.RealSniffer
+	syncEngine *hub.SyncEngine
+	nodeMgr    *hub.NodeManager
+	activeS1   string
+	activeS2   string
+	lastPing   hub.PingBurstReport
+	token      string
+	httpClient *http.Client
 }
 
 func main() {
@@ -71,7 +71,7 @@ func runDaemonServer(port, secret, token string) {
 	baseRoute := fmt.Sprintf("/matrix/%s", strings.Trim(secret, "/"))
 	mux := http.NewServeMux()
 
-	// 1. Start / Stop Both Servers (Default is Stopped)
+	// 1. Start / Stop Both Servers
 	mux.HandleFunc(baseRoute+"/api/control", func(w http.ResponseWriter, r *http.Request) {
 		action := r.URL.Query().Get("action")
 		if action == "start" {
@@ -100,7 +100,7 @@ func runDaemonServer(port, secret, token string) {
 		w.WriteHeader(http.StatusOK)
 	})
 
-	// 3. Add Remote Server via SSH
+	// 3. Add Remote Server via SSH (or Manual IP if password left blank)
 	mux.HandleFunc(baseRoute+"/api/nodes/add", func(w http.ResponseWriter, r *http.Request) {
 		var req struct {
 			Name     string `json:"name"`
@@ -112,7 +112,7 @@ func runDaemonServer(port, secret, token string) {
 		}
 		_ = json.NewDecoder(r.Body).Decode(&req)
 		id := fmt.Sprintf("node-%d", time.Now().Unix()%10000)
-		node, err := hc.nodeMgr.AddAndVerifySSH(id, req.Name, req.Role, req.Host, req.SSHPort, req.SSHUser, req.Password)
+		node, err := hc.nodeMgr.AddAndVerifySSH(id, req.Name, req.Role, strings.TrimSpace(req.Host), req.SSHPort, req.SSHUser, req.Password)
 		w.Header().Set("Content-Type", "application/json")
 		if err != nil {
 			_ = json.NewEncoder(w).Encode(map[string]any{"error": err.Error()})
@@ -127,7 +127,19 @@ func runDaemonServer(port, secret, token string) {
 		_ = json.NewEncoder(w).Encode(node)
 	})
 
-	// 4. Trigger Automated SSH Binary Deployment (0% -> 100%)
+	// 4. Delete Server Card from List
+	mux.HandleFunc(baseRoute+"/api/nodes/delete", func(w http.ResponseWriter, r *http.Request) {
+		id := r.URL.Query().Get("id")
+		hc.nodeMgr.DeleteNode(id)
+		hc.mu.Lock()
+		if hc.activeS2 == id {
+			hc.activeS2 = "local-s1"
+		}
+		hc.mu.Unlock()
+		w.WriteHeader(http.StatusOK)
+	})
+
+	// 5. Trigger Automated SSH Binary Deployment (0% -> 100%)
 	mux.HandleFunc(baseRoute+"/api/nodes/deploy", func(w http.ResponseWriter, r *http.Request) {
 		id := r.URL.Query().Get("id")
 		hubHost := strings.Split(r.Host, ":")[0]
@@ -135,7 +147,7 @@ func runDaemonServer(port, secret, token string) {
 		w.WriteHeader(http.StatusOK)
 	})
 
-	// 5. Smart 5-Ping Pause (Uses 1-Hour Cache or Runs 5 Real Pings)
+	// 6. Smart 5-Ping Pause (Uses 1-Hour Cache or Runs 5 Real Pings)
 	mux.HandleFunc(baseRoute+"/api/pause-burst", func(w http.ResponseWriter, r *http.Request) {
 		targetHost := hc.getS2HostPort()
 		report := hc.syncEngine.GetOrMeasure5Pings(targetHost, hc.token, false)
@@ -145,12 +157,12 @@ func runDaemonServer(port, secret, token string) {
 		hc.writeMergedState(w)
 	})
 
-	// 6. Live Merged 6-Checkpoint Real Packet State
+	// 7. Live Merged 6-Checkpoint Real Packet State
 	mux.HandleFunc(baseRoute+"/api/state", func(w http.ResponseWriter, r *http.Request) {
 		hc.writeMergedState(w)
 	})
 
-	// 7. Serve Main Dashboard
+	// 8. Serve Main Dashboard
 	mux.HandleFunc(baseRoute+"/", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		_, _ = w.Write([]byte(hub.DashboardHTML))
@@ -188,7 +200,6 @@ func (hc *HubCoordinator) forwardRemoteControl(action string) {
 func (hc *HubCoordinator) writeMergedState(w http.ResponseWriter) {
 	merged := hc.localSniff.GetSnapshot()
 
-	// Fetch real CP4-CP6 packets from S2 (Kharej) Agent if selected
 	hc.mu.RLock()
 	s1, s2, ping := hc.activeS1, hc.activeS2, hc.lastPing
 	hc.mu.RUnlock()
@@ -200,6 +211,7 @@ func (hc *HubCoordinator) writeMergedState(w http.ResponseWriter) {
 				Checkpoints map[models.CheckpointID][]models.PacketEvent `json:"checkpoints"`
 			}
 			if json.NewDecoder(resp.Body).Decode(&remoteSnap) == nil {
+				hc.nodeMgr.MarkNodeOnline(s2)
 				for cpID, evs := range remoteSnap.Checkpoints {
 					merged[cpID] = evs
 				}
