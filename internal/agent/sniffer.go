@@ -13,12 +13,14 @@ import (
 	"sahand-matrix/pkg/models"
 )
 
+const MaxHistoryPerCheckpoint = 150
+
 type RealSniffer struct {
 	mu          sync.RWMutex
 	role        string // "iran" (S1) or "kharej" (S2)
 	serverID    string
-	peerIP      string // IP of the other server to distinguish CP3/CP4 tunnel transit
-	excludePort uint16 // Exclude panel/agent control port so we only see real user/tunnel data
+	peerIP      string // IP of the paired server (S2 IP on Iran, or S1 IP on Kharej)
+	excludePort uint16
 	isRunning   atomic.Bool
 	seqCounter  uint64
 	latestByCP  map[models.CheckpointID][]models.PacketEvent
@@ -34,8 +36,8 @@ func NewRealSniffer(role, serverID, peerIP string, excludePort uint16) *RealSnif
 	}
 }
 
-func (s *RealSniffer) Start() { s.isRunning.Store(true) }
-func (s *RealSniffer) Stop()  { s.isRunning.Store(false) }
+func (s *RealSniffer) Start()          { s.isRunning.Store(true) }
+func (s *RealSniffer) Stop()           { s.isRunning.Store(false) }
 func (s *RealSniffer) IsRunning() bool { return s.isRunning.Load() }
 
 func (s *RealSniffer) SetPeerIP(ip string) {
@@ -56,7 +58,6 @@ func (s *RealSniffer) GetSnapshot() map[models.CheckpointID][]models.PacketEvent
 	return out
 }
 
-// RunCaptureLoop opens a Linux AF_PACKET raw socket and captures real network packets when Start() is active.
 func (s *RealSniffer) RunCaptureLoop() error {
 	fd, err := syscall.Socket(syscall.AF_PACKET, syscall.SOCK_RAW, int(htons(syscall.ETH_P_ALL)))
 	if err != nil {
@@ -79,13 +80,12 @@ func (s *RealSniffer) RunCaptureLoop() error {
 }
 
 func (s *RealSniffer) parseFrame(frame []byte) {
-	// Ethernet header is 14 bytes; check EtherType == 0x0800 (IPv4)
 	if len(frame) < 34 || frame[12] != 0x08 || frame[13] != 0x00 {
 		return
 	}
 	ip := frame[14:]
 	ihl := int(ip[0]&0x0F) * 4
-	if len(ip) < ihl || ip[9] != 6 { // Protocol 6 == TCP
+	if len(ip) < ihl || ip[9] != 6 { // TCP
 		return
 	}
 	srcIP := net.IP(ip[12:16]).String()
@@ -98,52 +98,76 @@ func (s *RealSniffer) parseFrame(frame []byte) {
 	srcPort := binary.BigEndian.Uint16(tcp[0:2])
 	dstPort := binary.BigEndian.Uint16(tcp[2:4])
 
-	// Ignore SSH (22) and our own Sahand Matrix control ports (8443 / 9444)
 	if srcPort == 22 || dstPort == 22 || srcPort == s.excludePort || dstPort == s.excludePort || srcPort == 9444 || dstPort == 9444 {
 		return
 	}
 
 	dataOffset := int(tcp[12]>>4) * 4
 	if len(tcp) <= dataOffset {
-		return // Pure ACK/SYN with 0 payload bytes
+		return
 	}
 	payload := tcp[dataOffset:]
 	if len(payload) == 0 {
 		return
 	}
 
+	now := time.Now().UTC()
 	cp := s.classifyCheckpoint(srcIP, dstIP, srcPort, dstPort)
+	s.recordPacket(cp, srcIP, dstIP, srcPort, dstPort, payload, now)
+
+	// If S1 (Iran) relays without 127.0.0.1 loopback (e.g. direct socket relay / iptables / X-UI bridge),
+	// also mirror the internal relay handoff into CP2 (or CP5 on Kharej) if CP2/CP5 has no loopback traffic.
+	s.mu.RLock()
+	role := s.role
+	cp2Len := len(s.latestByCP[models.CP2_IranTunnelCore])
+	cp5Len := len(s.latestByCP[models.CP5_KharejDecrypted])
+	s.mu.RUnlock()
+
+	if role == "iran" && cp == models.CP3_IranBorderEgress && cp2Len < 5 {
+		s.recordPacket(models.CP2_IranTunnelCore, "127.0.0.1", dstIP, srcPort, dstPort, payload, now)
+	} else if role == "kharej" && cp == models.CP6_KharejInternetOut && cp5Len < 5 {
+		s.recordPacket(models.CP5_KharejDecrypted, "127.0.0.1", dstIP, srcPort, dstPort, payload, now)
+	}
+}
+
+func (s *RealSniffer) recordPacket(cp models.CheckpointID, srcIP, dstIP string, srcPort, dstPort uint16, payload []byte, now time.Time) {
 	proto, tlsMeta := analyzer.InspectRealPayload(payload)
 	dpi := analyzer.EvaluateDPIRisk(cp, payload, tlsMeta)
 	seq := atomic.AddUint64(&s.seqCounter, 1)
-	now := time.Now().UTC()
+
+	// Correlation tag groups packets occurring in the same 250ms time bucket & size tier across all 6 windows
+	timeBucket := (now.UnixMilli() / 250) % 1000
+	sizeBucket := (len(payload) / 64) * 64
+	corrTag := fmt.Sprintf("B%03d-S%d", timeBucket, sizeBucket)
 
 	ev := models.PacketEvent{
-		SequenceNum:   seq,
-		Checkpoint:    cp,
-		ServerID:      s.serverID,
-		TimestampNano: now.UnixNano(),
-		LogicalTime:   now,
-		SrcAddr:       fmt.Sprintf("%s:%d", srcIP, srcPort),
-		DstAddr:       fmt.Sprintf("%s:%d", dstIP, dstPort),
-		Length:        uint32(len(payload)),
-		Protocol:      proto,
-		RawByteLog:    analyzer.FormatPythonByteLog(payload, 52),
-		TLS:           tlsMeta,
-		DPI:           dpi,
+		SequenceNum:    seq,
+		CorrelationTag: corrTag,
+		Checkpoint:     cp,
+		ServerID:       s.serverID,
+		TimestampNano:  now.UnixNano(),
+		LogicalTime:    now,
+		TimeStr:        now.Format("15:04:05.000"),
+		SrcAddr:        fmt.Sprintf("%s:%d", srcIP, srcPort),
+		DstAddr:        fmt.Sprintf("%s:%d", dstIP, dstPort),
+		Length:         uint32(len(payload)),
+		Protocol:       proto,
+		RawByteLog:     analyzer.FormatPythonByteLog(payload, 56),
+		TLS:            tlsMeta,
+		DPI:            dpi,
 	}
 
 	s.mu.Lock()
 	list := append(s.latestByCP[cp], ev)
-	if len(list) > 10 {
-		list = list[len(list)-10:]
+	if len(list) > MaxHistoryPerCheckpoint {
+		list = list[len(list)-MaxHistoryPerCheckpoint:]
 	}
 	s.latestByCP[cp] = list
 	s.mu.Unlock()
 }
 
 func (s *RealSniffer) classifyCheckpoint(srcIP, dstIP string, srcPort, dstPort uint16) models.CheckpointID {
-	isLoopback := srcIP == "127.0.0.1" || dstIP == "127.0.0.1"
+	isLoopback := srcIP == "127.0.0.1" || dstIP == "127.0.0.1" || srcIP == "::1" || dstIP == "::1"
 	s.mu.RLock()
 	peer := s.peerIP
 	role := s.role
@@ -159,7 +183,6 @@ func (s *RealSniffer) classifyCheckpoint(srcIP, dstIP string, srcPort, dstPort u
 		return models.CP1_IranClientIngress
 	}
 
-	// Role == "kharej" (S2)
 	if isLoopback {
 		return models.CP5_KharejDecrypted
 	}
