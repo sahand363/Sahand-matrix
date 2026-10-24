@@ -44,24 +44,29 @@ func FormatPythonByteLog(payload []byte, maxBytes int) string {
 	return sb.String()
 }
 
-// InspectRealPayload parses actual captured TCP payload bytes for TLS headers, SNI, or HTTP leaks.
+// InspectRealPayload detects TLS 1.2/1.3 records (0x14 ChangeCipherSpec, 0x16 Handshake, 0x17 AppData)
+// or cleartext HTTP/SSH headers.
 func InspectRealPayload(payload []byte) (proto string, tls models.TLSMetadata) {
 	if len(payload) < 5 {
-		return "TCP/RAW", tls
+		return "TCP-SHORT", tls
 	}
-	// Check real TLS framing: 0x16 (Handshake) or 0x17 (Application Data) followed by 0x03 0x01..0x04
-	if (payload[0] == 0x16 || payload[0] == 0x17) && payload[1] == 0x03 && payload[2] <= 0x04 {
+	b0, b1, b2 := payload[0], payload[1], payload[2]
+	if (b0 == 0x14 || b0 == 0x15 || b0 == 0x16 || b0 == 0x17) && b1 == 0x03 && b2 <= 0x04 {
 		tls.IsTLS = true
-		tls.Version = fmt.Sprintf("0x03%02x", payload[2])
-		if payload[0] == 0x16 {
-			tls.RecordType = "TLS Handshake (0x16)"
+		tls.Version = fmt.Sprintf("0x03%02x", b2)
+		switch b0 {
+		case 0x16:
+			tls.RecordType = "Handshake (0x16)"
 			tls.SNI = extractSNIFromClientHello(payload)
 			return "TLS-Handshake", tls
+		case 0x14:
+			tls.RecordType = "CipherSpec (0x14)"
+			return "TLS-CipherSpec", tls
+		default:
+			tls.RecordType = "AppData (0x17)"
+			return "TLSv1.3/WSS", tls
 		}
-		tls.RecordType = "TLS AppData (0x17)"
-		return "TLSv1.3/WSS", tls
 	}
-	// Check for cleartext HTTP / WebSocket upgrade
 	head := string(payload[:min(len(payload), 32)])
 	for _, m := range []string{"GET ", "POST ", "HTTP/1.", "CONNECT ", "HEAD "} {
 		if strings.HasPrefix(head, m) {
@@ -69,13 +74,12 @@ func InspectRealPayload(payload []byte) (proto string, tls models.TLSMetadata) {
 		}
 	}
 	if strings.HasPrefix(head, "SSH-") {
-		return "SSH-TUNNEL", tls
+		return "SSH-STREAM", tls
 	}
-	return "RAW-BINARY", tls
+	return "RAW-STREAM", tls
 }
 
 func extractSNIFromClientHello(b []byte) string {
-	// Lightweight scan for printable domain-like ASCII inside TLS ClientHello extension 0x0000
 	for i := 0; i+9 < len(b); i++ {
 		if b[i] == 0x00 && b[i+1] == 0x00 && b[i+6] == 0x00 {
 			nameLen := int(b[i+7])<<8 | int(b[i+8])
@@ -108,107 +112,117 @@ func EvaluateDPIRisk(cp models.CheckpointID, payload []byte, tls models.TLSMetad
 			StealthScore:   100,
 			RiskScore:      0,
 			Level:          models.RiskOptimal,
-			Explanation:    "SAFE (Internal Server Loopback): Inside server memory. Iran DPI has zero visibility here.",
+			ColorMeaning:   "🔵 BLUE LINE = Safe Internal Handoff (Invisible to External DPI)",
+			Explanation:    "SAFE (Internal Server Handoff): Traffic inside server memory/tunnel core. Iran DPI cannot see this window.",
 		}
 	}
 
-	risk := 0
-	var triggers []string
-	var explanation string
-
-	if !tls.IsTLS && entropy > 6.7 {
-		risk = 88
-		triggers = append(triggers, "UNFRAMED_HIGH_ENTROPY", "NO_TLS_HEADER")
-		explanation = fmt.Sprintf("DANGER (Red Alert): High entropy (%.2f/8.00) with NO TLS header (\\x17\\x03\\x03)! Iran DPI flags raw encrypted ports (Rathole/Raw-SS) via entropy & active probing.", entropy)
-	} else if !tls.IsTLS && entropy <= 6.7 && len(payload) > 10 {
-		risk = 95
-		triggers = append(triggers, "CLEARTEXT_LEAK")
-		explanation = "CRITICAL LEAK: Unencrypted plaintext bytes detected on an external interface! Iran DPI can read payload keywords directly."
-	} else if tls.IsTLS && tls.SNI != "" {
-		risk = 15
-		explanation = fmt.Sprintf("TLS HANDSHAKE: Valid TLS header (\\x16\\x03\\x03). Cleartext SNI '%s' is visible to DPI—ensure this domain is whitelisted.", tls.SNI)
-	} else {
-		risk = 8
-		explanation = fmt.Sprintf("OPTIMAL STEALTH: Valid TLS Application Data (\\x17\\x03\\x03) with H(X)=%.2f. Looks like standard HTTPS/WSS traffic to Iran DPI.", entropy)
+	if tls.IsTLS {
+		if tls.SNI != "" {
+			return models.DPIAssessment{
+				ShannonEntropy: entropy,
+				StealthScore:   82,
+				RiskScore:      18,
+				Level:          models.RiskWarning,
+				ColorMeaning:   "🟡 AMBER LINE = TLS Handshake with Cleartext SNI (" + tls.SNI + ")",
+				Explanation:    fmt.Sprintf("TLS HANDSHAKE: Valid TLS header (\\x16\\x03). Domain '%s' is visible to Iran DPI—safe if whitelisted.", tls.SNI),
+			}
+		}
+		return models.DPIAssessment{
+			ShannonEntropy: entropy,
+			StealthScore:   94,
+			RiskScore:      6,
+			Level:          models.RiskOptimal,
+			ColorMeaning:   "🔵 BLUE LINE = Safe Encrypted TLS Frame (\\x17\\x03\\x03)",
+			Explanation:    fmt.Sprintf("SAFE FOR DPI (Blue): Wrapped inside valid TLS record (\\x17\\x03\\x03) with Entropy %.2f/8.00. Looks like standard HTTPS.", entropy),
+		}
 	}
 
-	level := models.RiskOptimal
-	if risk >= 70 {
-		level = models.RiskCritical
-	} else if risk >= 35 {
-		level = models.RiskWarning
+	// Non-TLS external packet -> RED (Exposed)
+	if entropy > 6.5 {
+		return models.DPIAssessment{
+			ShannonEntropy: entropy,
+			StealthScore:   12,
+			RiskScore:      88,
+			Level:          models.RiskCritical,
+			ColorMeaning:   "🔴 RED LINE = Unframed High-Entropy Stream (No \\x17\\x03\\x03 TLS Header!)",
+			Triggers:       []string{"NO_TLS_HEADER", "RAW_CIPHERTEXT"},
+			Explanation:    fmt.Sprintf("EXPOSED TO DPI (Red): High entropy (%.2f/8.00) WITHOUT a TLS header! Iran DPI detects raw encrypted tunnels or segmented TCP chunks here.", entropy),
+		}
 	}
+
 	return models.DPIAssessment{
 		ShannonEntropy: entropy,
-		StealthScore:   max(0, 100-risk),
-		RiskScore:      risk,
-		Level:          level,
-		Triggers:       triggers,
-		Explanation:    explanation,
+		StealthScore:   5,
+		RiskScore:      95,
+		Level:          models.RiskCritical,
+		ColorMeaning:   "🔴 RED LINE = Unencrypted Plaintext / Raw Control Bytes Exposed!",
+		Triggers:       []string{"PLAINTEXT_EXPOSED"},
+		Explanation:    fmt.Sprintf("CRITICAL LEAK (Red): Unencrypted/low-entropy raw data (H=%.2f) without TLS! Directly readable by Iran DPI.", entropy),
 	}
 }
 
 func AllCheckpointGuides() []models.CheckpointGuide {
 	return []models.CheckpointGuide{
 		{
-			ID:          models.CP1_IranClientIngress,
-			Title:       "CP1: Iran Entry NIC (Client ➔ S1)",
-			ServerRole:  "iran",
-			DPIVisible:  true,
-			DPIZone:     "🚨 CRITICAL: IRAN DOMESTIC DPI (TCI/MCI)",
-			WhatYouSee:  "Raw packets arriving at your Iran server from your PC/Phone in Iran.",
-			GoodForDPI:  "TLS 1.3 frames (\\x17\\x03\\x03) or whitelisted domestic SNI.",
-			BadForDPI:   "Unencrypted HTTP headers, blocked foreign SNIs, or raw high-entropy noise.",
+			ID:         models.CP1_IranClientIngress,
+			Title:      "CP1: Iran Entry NIC (Client ➔ S1)",
+			ServerRole: "iran",
+			DPIVisible: true,
+			DPIZone:    "🚨 CRITICAL: IRAN DOMESTIC DPI (TCI/MCI)",
+			WhatYouSee: "Packets arriving at your Iran server from your PC/Phone in Iran.",
+			GoodForDPI: "🔵 Blue lines: TLS 1.3 frames (\\x17\\x03\\x03) or safe domestic SNI.",
+			BadForDPI:  "🔴 Red lines: Plaintext headers or raw high-entropy noise without TLS.",
 		},
 		{
-			ID:          models.CP2_IranTunnelCore,
-			Title:       "CP2: Iran Server Tunnel Core (Internal)",
-			ServerRole:  "iran",
-			DPIVisible:  false,
-			DPIZone:     "🔒 INVISIBLE TO DPI (S1 Internal)",
-			WhatYouSee:  "Local loopback traffic inside S1 as X-UI / Rathole / WSS packages your stream.",
-			GoodForDPI:  "Any internal proxy framing is safe here because DPI cannot see inside S1.",
-			BadForDPI:   "N/A — Completely isolated inside Iran server RAM.",
+			ID:         models.CP2_IranTunnelCore,
+			Title:      "CP2: Iran Server Tunnel Core / Relay Handoff (Internal)",
+			ServerRole: "iran",
+			DPIVisible: false,
+			DPIZone:    "🔒 INVISIBLE TO DPI (S1 Internal)",
+			WhatYouSee: "Internal loopback & relay handoff inside S1 as your tunnel packages the stream.",
+			GoodForDPI: "🔵 Blue lines: Internal proxy/tunnel frames inside S1 RAM.",
+			BadForDPI:  "N/A — Isolated inside Iran server.",
 		},
 		{
-			ID:          models.CP3_IranBorderEgress,
-			Title:       "CP3: International Border Transit (S1 ➔ S2)",
-			ServerRole:  "iran",
-			DPIVisible:  true,
-			DPIZone:     "🚨 CRITICAL: IRAN BORDER GATEWAY (GCI)",
-			WhatYouSee:  "Tunnel packets leaving your Iran server across the border to your Kharej server.",
-			GoodForDPI:  "WSS/Reality/TLS framing (\\x17\\x03\\x03) with normal packet-size distribution.",
-			BadForDPI:   "Raw unmasked port-forwarding or high-entropy streams without TLS headers.",
+			ID:         models.CP3_IranBorderEgress,
+			Title:      "CP3: International Border Transit (S1 ➔ S2)",
+			ServerRole: "iran",
+			DPIVisible: true,
+			DPIZone:    "🚨 CRITICAL: IRAN BORDER GATEWAY (GCI)",
+			WhatYouSee: "Tunnel packets leaving your Iran server across the border to Kharej (S2).",
+			GoodForDPI: "🔵 Blue lines: Valid TLS/WSS/Reality frames (\\x17\\x03\\x03).",
+			BadForDPI:  "🔴 Red lines: Unmasked raw port-forwarding or plaintext sync strings.",
 		},
 		{
-			ID:          models.CP4_KharejTransitIn,
-			Title:       "CP4: Kharej Ingress NIC (S1 ➔ S2 Arrival)",
-			ServerRole:  "kharej",
-			DPIVisible:  true,
-			DPIZone:     "👁 INT'L DATACENTER EDGE",
-			WhatYouSee:  "Tunnel packets arriving at your Kharej server's network card from Iran.",
-			GoodForDPI:  "Should match CP3 byte-for-byte (delayed by RTT/2 transit time).",
-			BadForDPI:   "Missing packets or altered TCP payloads (indicates GCI border tampering).",
+			ID:         models.CP4_KharejTransitIn,
+			Title:      "CP4: Kharej Ingress NIC (S1 ➔ S2 Arrival)",
+			ServerRole: "kharej",
+			DPIVisible: true,
+			DPIZone:    "👁 INT'L DATACENTER EDGE",
+			WhatYouSee: "Tunnel packets arriving at your Kharej server's network card from Iran.",
+			GoodForDPI: "🔵 Blue lines matching CP3's [TAG:xxxx] burst after +RTT/2 delay.",
+			BadForDPI:  "🔴 Red lines or missing tags (indicates GCI border packet tampering).",
 		},
 		{
-			ID:          models.CP5_KharejDecrypted,
-			Title:       "CP5: Kharej Decryption Core (Internal)",
-			ServerRole:  "kharej",
-			DPIVisible:  false,
-			DPIZone:     "🔒 INVISIBLE TO DPI (S2 Internal)",
-			WhatYouSee:  "Unwrapped inner request inside your Kharej server before heading to the web.",
-			GoodForDPI:  "Clean decrypted streams ready for outbound routing.",
-			BadForDPI:   "N/A — Inside foreign server memory.",
+			ID:         models.CP5_KharejDecrypted,
+			Title:      "CP5: Kharej Decryption Core (Internal)",
+			ServerRole: "kharej",
+			DPIVisible: false,
+			DPIZone:    "🔒 INVISIBLE TO DPI (S2 Internal)",
+			WhatYouSee: "Decrypted inner stream inside your Kharej server before heading to the web.",
+			GoodForDPI: "🔵 Blue lines: Clean internal handoff.",
+			BadForDPI:  "N/A — Inside foreign server memory.",
 		},
 		{
-			ID:          models.CP6_KharejInternetOut,
-			Title:       "CP6: Open Internet Egress (S2 ➔ YouTube/Telegram)",
-			ServerRole:  "kharej",
-			DPIVisible:  false,
-			DPIZone:     "🌍 OPEN GLOBAL INTERNET",
-			WhatYouSee:  "Final outbound traffic from your Kharej server to YouTube, Telegram, or APIs.",
-			GoodForDPI:  "Standard HTTPS/TLS (Port 443) to destination services.",
-			BadForDPI:   "None — Safely outside Iran's national firewall.",
+			ID:         models.CP6_KharejInternetOut,
+			Title:      "CP6: Open Internet Egress (S2 ➔ YouTube/Telegram)",
+			ServerRole: "kharej",
+			DPIVisible: false,
+			DPIZone:    "🌍 OPEN GLOBAL INTERNET",
+			WhatYouSee: "Final outbound traffic from your Kharej server to YouTube, Telegram, or APIs.",
+			GoodForDPI: "🔵 Blue lines: Standard HTTPS (Port 443) to global destinations.",
+			BadForDPI:  "None — Safely outside Iran's national firewall.",
 		},
 	}
 }
