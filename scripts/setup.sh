@@ -127,6 +127,7 @@ download_or_build_binaries() {
   fi
 
   cd "$tmp_dir"
+  go mod tidy
   CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o "${INSTALL_DIR}/sahand-hub" ./cmd/sahand-hub
   CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o "${INSTALL_DIR}/sahand-agent" ./cmd/sahand-agent
   cp -f "$tmp_dir/scripts/install.sh" "${INSTALL_DIR}/sahand-menu"
