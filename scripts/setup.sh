@@ -1,188 +1,219 @@
 #!/usr/bin/env bash
-set -e
+set -euo pipefail
 
-export PATH=$PATH:/usr/local/go/bin
+REPO_Owner="sahand363"
+REPO_NAME="Sahand-matrix"
+INSTALL_DIR="/usr/local/bin"
+CONF_DIR="/etc/sahand"
+CONF_FILE="${CONF_DIR}/config.env"
 
-REPO_OWNER="${SAHAND_REPO_OWNER:-sahand363}"
-REPO_NAME="${SAHAND_REPO_NAME:-sahand-matrix}"
-INSTALL_DIR="/opt/sahand-matrix"
-CONFIG_FILE="${INSTALL_DIR}/config.env"
-HUB_SERVICE="/etc/systemd/system/sahand-hub.service"
-AGENT_SERVICE="/etc/systemd/system/sahand-agent.service"
+GREEN='\033[0;32m'
+CYAN='\033[0;36m'
+AMBER='\033[1;33m'
+RED='\033[0;31m'
+NC='\033[0m'
 
-CYAN='\033[1;36m'; PURPLE='\033[1;35m'; EMERALD='\033[1;32m'
-AMBER='\033[1;33m'; CRIMSON='\033[1;31m'; MUTED='\033[0;90m'; RESET='\033[0m'
+mkdir -p "$CONF_DIR"
+chmod 700 "$CONF_DIR"
 
-require_root() {
-    if [[ $EUID -ne 0 ]]; then
-        echo -e "${CRIMSON}[!] Run as root (sudo).${RESET}"; exit 1
-    fi
+# Load or initialize persistent configuration (Secret link never changes unless regenerated in menu)
+if [[ -f "$CONF_FILE" ]]; then
+  source "$CONF_FILE"
+fi
+
+NODE_ROLE="${NODE_ROLE:-main}"
+HUB_PORT="${HUB_PORT:-8443}"
+AGENT_PORT="${AGENT_PORT:-9444}"
+SECRET_PATH="${SECRET_PATH:-$(head -c 12 /dev/urandom | base64 | tr -dc 'a-zA-Z0-9' | head -c 14)}"
+SHARED_TOKEN="${SHARED_TOKEN:-$(head -c 18 /dev/urandom | base64 | tr -dc 'a-zA-Z0-9' | head -c 22)}"
+AUTH_USER="${AUTH_USER:-}"
+AUTH_PASS="${AUTH_PASS:-}"
+PEER_IP="${PEER_IP:-}"
+
+save_config() {
+  cat > "$CONF_FILE" <<EOF
+NODE_ROLE="${NODE_ROLE}"
+HUB_PORT="${HUB_PORT}"
+AGENT_PORT="${AGENT_PORT}"
+SECRET_PATH="${SECRET_PATH}"
+SHARED_TOKEN="${SHARED_TOKEN}"
+AUTH_USER="${AUTH_USER}"
+AUTH_PASS="${AUTH_PASS}"
+PEER_IP="${PEER_IP}"
+EOF
+  chmod 600 "$CONF_FILE"
 }
 
 get_public_ip() {
-    curl -s4 --max-time 4 https://icanhazip.com || hostname -I | awk '{print $1}'
+  curl -s4 --max-time 4 https://api.ipify.org || hostname -I | awk '{print $1}'
 }
 
-install_dependencies() {
-    echo -e "${CYAN}[*] Installing system packages...${RESET}"
-    apt-get update -y -qq
-    apt-get install -y -qq curl wget git tar ca-certificates openssl iputils-ping > /dev/null
-
-    if ! command -v go &> /dev/null; then
-        echo -e "${CYAN}[*] Installing Go 1.23 toolchain...${RESET}"
-        wget -q https://go.dev/dl/go1.23.2.linux-amd64.tar.gz -O /tmp/go.tar.gz
-        rm -rf /usr/local/go && tar -C /usr/local -xzf /tmp/go.tar.gz
-        ln -sf /usr/local/go/bin/go /usr/bin/go
-        ln -sf /usr/local/go/bin/go /usr/local/bin/go
-        rm -f /tmp/go.tar.gz
-    fi
-}
-
-generate_secret_config() {
-    mkdir -p "${INSTALL_DIR}"
-    if [[ ! -f "${CONFIG_FILE}" ]]; then
-        SECRET_PATH=$(openssl rand -hex 8)
-        AGENT_TOKEN=$(openssl rand -hex 16)
-        PUBLIC_IP=$(get_public_ip)
-        cat <<EOF > "${CONFIG_FILE}"
-PANEL_PORT=8443
-SECRET_PATH=${SECRET_PATH}
-AGENT_TOKEN=${AGENT_TOKEN}
-HUB_IP=${PUBLIC_IP}
-EOF
-        chmod 600 "${CONFIG_FILE}"
-    fi
-    source "${CONFIG_FILE}"
-}
-
-build_or_fetch_binaries() {
-    install_dependencies
-    mkdir -p "${INSTALL_DIR}/bin"
-    echo -e "${CYAN}[*] Fetching latest Sahand Traffic Matrix source from GitHub...${RESET}"
-    rm -rf "${INSTALL_DIR}/src"
-    GIT_TERMINAL_PROMPT=0 git clone --depth 1 "https://github.com/${REPO_OWNER}/${REPO_NAME}.git" "${INSTALL_DIR}/src"
-    cd "${INSTALL_DIR}/src"
-    echo -e "${CYAN}[*] Compiling sahand-hub & sahand-agent binaries...${RESET}"
-    /usr/local/go/bin/go mod tidy
-    CGO_ENABLED=0 GOOS=linux GOARCH=amd64 /usr/local/go/bin/go build -ldflags="-s -w" -o "${INSTALL_DIR}/bin/sahand-hub" ./cmd/sahand-hub
-    CGO_ENABLED=0 GOOS=linux GOARCH=amd64 /usr/local/go/bin/go build -ldflags="-s -w" -o "${INSTALL_DIR}/bin/sahand-agent" ./cmd/sahand-agent
-    chmod +x "${INSTALL_DIR}/bin/sahand-hub" "${INSTALL_DIR}/bin/sahand-agent"
-
-    # Install permanent 'sahand-menu' and 'sahand-matrix' commands
-    cp "${INSTALL_DIR}/src/scripts/setup.sh" "${INSTALL_DIR}/setup.sh"
-    chmod +x "${INSTALL_DIR}/setup.sh"
-    ln -sf "${INSTALL_DIR}/setup.sh" /usr/local/bin/sahand-menu
-    ln -sf "${INSTALL_DIR}/bin/sahand-hub" /usr/local/bin/sahand-matrix
-}
-
-install_hub_service() {
-    require_root
-    generate_secret_config
-    build_or_fetch_binaries
-
-    cat <<EOF > "${HUB_SERVICE}"
+write_systemd_units() {
+  save_config
+  if [[ "$NODE_ROLE" == "main" ]]; then
+    cat > /etc/systemd/system/sahand-hub.service <<EOF
 [Unit]
-Description=Sahand Traffic Matrix Hub & Real Packet Sniffer
+Description=Sahand Matrix Hub (Main Server 6-Window Lab)
 After=network.target
 
 [Service]
 Type=simple
-WorkingDirectory=${INSTALL_DIR}
-EnvironmentFile=${CONFIG_FILE}
-ExecStart=${INSTALL_DIR}/bin/sahand-hub --daemon --port \${PANEL_PORT} --secret \${SECRET_PATH} --token \${AGENT_TOKEN}
+User=root
+ExecStart=${INSTALL_DIR}/sahand-hub -daemon -port ${HUB_PORT} -secret ${SECRET_PATH} -token ${SHARED_TOKEN} -auth-user "${AUTH_USER}" -auth-pass "${AUTH_PASS}"
 Restart=always
 RestartSec=3
 
 [Install]
 WantedBy=multi-user.target
 EOF
-
     systemctl daemon-reload
-    systemctl enable sahand-hub --now
-    echo -e "${EMERALD}[✓] Installed! Type 'sahand-menu' anytime in SSH to open this menu.${RESET}"
-    show_access_details
-}
-
-deploy_agent_only() {
-    require_root
-    build_or_fetch_binaries
-    read -rp "Enter Peer/Hub IP Address: " PEER_IP
-    read -rp "Enter Agent Auth Token: " TARGET_TOKEN
-    read -rp "Select Server Role [1 = Iran S1 (CP1-CP3), 2 = Kharej S2 (CP4-CP6)]: " ROLE_NUM
-    ROLE_FLAG="kharej"
-    [[ "$ROLE_NUM" == "1" ]] && ROLE_FLAG="iran"
-
-    cat <<EOF > "${AGENT_SERVICE}"
+    systemctl enable sahand-hub >/dev/null 2>&1 || true
+    systemctl restart sahand-hub
+  else
+    cat > /etc/systemd/system/sahand-agent.service <<EOF
 [Unit]
-Description=Sahand Real Packet Sniffer Agent
+Description=Sahand Matrix Sentinel (Server 2/3 3-Window Node)
 After=network.target
 
 [Service]
 Type=simple
-ExecStart=${INSTALL_DIR}/bin/sahand-agent --role ${ROLE_FLAG} --peer ${PEER_IP} --token ${TARGET_TOKEN} --listen :9444
+User=root
+ExecStart=${INSTALL_DIR}/sahand-agent -role kharej -id server-2 -listen :${AGENT_PORT} -peer "${PEER_IP}" -token "${SHARED_TOKEN}" -secret "${SECRET_PATH}" -auth-user "${AUTH_USER}" -auth-pass "${AUTH_PASS}"
 Restart=always
-RestartSec=2
+RestartSec=3
 
 [Install]
 WantedBy=multi-user.target
 EOF
-    systemctl daemon-reload && systemctl enable sahand-agent --now
-    PUBLIC_IP=$(get_public_ip)
-    echo -e "${EMERALD}[✓] Agent active! Local 3-Window View: http://${PUBLIC_IP}:9444/${RESET}"
-}
-
-update_matrix() {
-    require_root
-    build_or_fetch_binaries
-    systemctl restart sahand-hub 2>/dev/null || true
-    systemctl restart sahand-agent 2>/dev/null || true
-    echo -e "${EMERALD}[✓] Updated & restarted! (Shortcut 'sahand-menu' is active).${RESET}"
-}
-
-uninstall_matrix() {
-    require_root
-    systemctl stop sahand-hub sahand-agent 2>/dev/null || true
-    systemctl disable sahand-hub sahand-agent 2>/dev/null || true
-    rm -f "${HUB_SERVICE}" "${AGENT_SERVICE}" /usr/local/bin/sahand-matrix /usr/local/bin/sahand-menu
     systemctl daemon-reload
-    rm -rf "${INSTALL_DIR}"
-    echo -e "${EMERALD}[✓] Uninstalled.${RESET}"
+    systemctl enable sahand-agent >/dev/null 2>&1 || true
+    systemctl restart sahand-agent
+  fi
 }
 
-show_access_details() {
-    if [[ -f "${CONFIG_FILE}" ]]; then
-        source "${CONFIG_FILE}"
-        echo -e "\n${PURPLE}=====================================================================${RESET}"
-        echo -e " ${EMERALD}● Web Panel URL (HTTP/HTTPS) :${RESET} http://${HUB_IP}:${PANEL_PORT}/matrix/${SECRET_PATH}/"
-        echo -e " ${CYAN}● Open Menu Shortcut in SSH  :${RESET} sahand-menu"
-        echo -e " ${CYAN}● Open Terminal UI in SSH    :${RESET} sahand-matrix"
-        echo -e " ${AMBER}● Agent Auth Token           :${RESET} ${AGENT_TOKEN}"
-        echo -e "${PURPLE}=====================================================================${RESET}\n"
-    fi
+print_access_urls() {
+  local ip
+  ip=$(get_public_ip)
+  echo -e "\n${CYAN}=================================================================${NC}"
+  if [[ "$NODE_ROLE" == "main" ]]; then
+    echo -e "${GREEN}✔ MAIN SERVER (6-WINDOW MATRIX) ACTIVE:${NC}"
+    echo -e "  🔗 HTTP URL  : ${AMBER}http://${ip}:${HUB_PORT}/matrix/${SECRET_PATH}/${NC}"
+    echo -e "  🔒 HTTPS URL : ${AMBER}https://${ip}:${HUB_PORT}/matrix/${SECRET_PATH}/${NC}"
+  else
+    echo -e "${GREEN}✔ SERVER 2 / 3 SENTINEL (3-WINDOW VIEW) ACTIVE:${NC}"
+    echo -e "  🔗 Secret URL: ${AMBER}http://${ip}:${AGENT_PORT}/sentinel/${SECRET_PATH}/${NC}"
+    echo -e "  📡 Hub API   : ${CYAN}http://${ip}:${AGENT_PORT}/api/snapshot${NC}"
+  fi
+  if [[ -n "$AUTH_USER" ]]; then
+    echo -e "  🔐 Auth      : ${GREEN}Enabled (Username: ${AUTH_USER})${NC}"
+  else
+    echo -e "  🔓 Auth      : ${CYAN}Passwordless (Protected by Persistent Random Secret Link)${NC}"
+  fi
+  echo -e "${CYAN}=================================================================${NC}\n"
 }
 
-while true; do
-    clear
-    echo -e "${PURPLE}╔═══════════════════════════════════════════════════════════════════╗${RESET}"
-    echo -e "${PURPLE}║${RESET}   ${CYAN}🕸  SAHAND TRAFFIC MATRIX${RESET} ${MUTED}// REAL PACKET & IRAN DPI LAB${RESET}          ${PURPLE}║${RESET}"
-    echo -e "${PURPLE}╠═══════════════════════════════════════════════════════════════════╣${RESET}"
-    echo -e "${PURPLE}║${RESET}  ${EMERALD}1)${RESET} Install / Reconfigure Central Hub & Panel (Primary Server)    ${PURPLE}║${RESET}"
-    echo -e "${PURPLE}║${RESET}  ${CYAN}2)${RESET} Deploy Lightweight sahand-agent Only (2nd / Kharej Server)    ${PURPLE}║${RESET}"
-    echo -e "${PURPLE}║${RESET}  ${CYAN}3)${RESET} Launch Live 6-Checkpoint Terminal UI (sahand-matrix)          ${PURPLE}║${RESET}"
-    echo -e "${PURPLE}║${RESET}  ${AMBER}4)${RESET} Show Secure Panel Link & Agent Token                          ${PURPLE}║${RESET}"
-    echo -e "${PURPLE}║${RESET}  ${AMBER}5)${RESET} Update Sahand Matrix (Pull Latest from GitHub)                ${PURPLE}║${RESET}"
-    echo -e "${PURPLE}║${RESET}  ${CRIMSON}6)${RESET} Uninstall Sahand Matrix & Clean Up                            ${PURPLE}║${RESET}"
-    echo -e "${PURPLE}║${RESET}  ${MUTED}0)${RESET} Exit                                                          ${PURPLE}║${RESET}"
-    echo -e "${PURPLE}╚═══════════════════════════════════════════════════════════════════╝${RESET}"
-    read -rp "Select an option [0-6]: " choice
-    case "$choice" in
-        1) install_hub_service ;;
-        2) deploy_agent_only ;;
-        3) /usr/local/bin/sahand-matrix ;;
-        4) show_access_details ;;
-        5) update_matrix ;;
-        6) uninstall_matrix ;;
-        0) exit 0 ;;
+download_or_build_binaries() {
+  echo -e "${CYAN}[*] Fetching latest Sahand Matrix source & building binaries...${NC}"
+  local tmp_dir="/tmp/sahand-build-$$"
+  rm -rf "$tmp_dir"
+  git clone --depth 1 "https://github.com/${REPO_Owner}/${REPO_NAME}.git" "$tmp_dir"
+
+  if ! command -v go >/dev/null 2>&1; then
+    echo -e "${AMBER}[*] Installing Go compiler...${NC}"
+    curl -fsSL https://go.dev/dl/go1.23.2.linux-amd64.tar.gz -o /tmp/go.tar.gz
+    rm -rf /usr/local/go && tar -C /usr/local -xzf /tmp/go.tar.gz
+    export PATH=$PATH:/usr/local/go/bin
+    ln -sf /usr/local/go/bin/go /usr/bin/go
+  fi
+
+  cd "$tmp_dir"
+  CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o "${INSTALL_DIR}/sahand-hub" ./cmd/sahand-hub
+  CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o "${INSTALL_DIR}/sahand-agent" ./cmd/sahand-agent
+  cp -f "$tmp_dir/scripts/install.sh" "${INSTALL_DIR}/sahand-menu"
+  chmod +x "${INSTALL_DIR}/sahand-hub" "${INSTALL_DIR}/sahand-agent" "${INSTALL_DIR}/sahand-menu"
+  rm -rf "$tmp_dir"
+}
+
+install_menu() {
+  while true; do
+    echo -e "\n${CYAN}❖ SAHAND MATRIX // MANAGEMENT MENU (${NODE_ROLE^^} SERVER)${NC}"
+    echo "  1) Install / Switch to Main Server (6-Window Hub)"
+    echo "  2) Install / Switch to Server 2 / Server 3 (3-Window Sentinel)"
+    echo "  3) Show My Secret Web Panel Link & Auth Status"
+    echo "  4) Launch Terminal TUI Analyzer"
+    echo "  5) Update Sahand Matrix from GitHub (Preserves Secret Link)"
+    echo "  6) 🔄 Generate New Random Secret Link (Main Server or Sentinel)"
+    echo "  7) 🔐 Set or Clear Web Panel Username & Password"
+    echo "  8) Uninstall Sahand Matrix"
+    echo "  0) Exit"
+    read -rp "Select option [0-8]: " opt
+    case "$opt" in
+      1)
+        NODE_ROLE="main"
+        download_or_build_binaries
+        write_systemd_units
+        print_access_urls
+        ;;
+      2)
+        NODE_ROLE="sentinel"
+        read -rp "Enter Main Server IP (optional, for CP4 classification): " PEER_IP
+        download_or_build_binaries
+        write_systemd_units
+        print_access_urls
+        ;;
+      3)
+        print_access_urls
+        ;;
+      4)
+        "${INSTALL_DIR}/sahand-hub"
+        ;;
+      5)
+        download_or_build_binaries
+        write_systemd_units
+        echo -e "${GREEN}✔ Updated! Your existing secret link and settings were preserved.${NC}"
+        print_access_urls
+        ;;
+      6)
+        SECRET_PATH=$(head -c 12 /dev/urandom | base64 | tr -dc 'a-zA-Z0-9' | head -c 14)
+        write_systemd_units
+        echo -e "${GREEN}✔ Generated new random secret link!${NC}"
+        print_access_urls
+        ;;
+      7)
+        read -rp "Enter new Username (leave blank to disable password protection): " new_u
+        if [[ -z "$new_u" ]]; then
+          AUTH_USER=""
+          AUTH_PASS=""
+          echo -e "${AMBER}[*] Password protection disabled (using secret link only).${NC}"
+        else
+          read -rsp "Enter new Password: " new_p
+          echo ""
+          AUTH_USER="$new_u"
+          AUTH_PASS="$new_p"
+          echo -e "${GREEN}✔ Username & Password enabled!${NC}"
+        fi
+        write_systemd_units
+        print_access_urls
+        ;;
+      8)
+        systemctl stop sahand-hub sahand-agent >/dev/null 2>&1 || true
+        systemctl disable sahand-hub sahand-agent >/dev/null 2>&1 || true
+        rm -f /etc/systemd/system/sahand-hub.service /etc/systemd/system/sahand-agent.service
+        rm -f "${INSTALL_DIR}/sahand-hub" "${INSTALL_DIR}/sahand-agent" "${INSTALL_DIR}/sahand-menu"
+        echo -e "${RED}✔ Sahand Matrix uninstalled.${NC}"
+        exit 0
+        ;;
+      0) exit 0 ;;
     esac
-    read -rp "Press [ENTER] to return to menu..."
-done
+  done
+}
+
+if [[ "${1:-}" == "--auto-main" ]]; then
+  NODE_ROLE="main"
+  download_or_build_binaries
+  write_systemd_units
+  print_access_urls
+  exit 0
+fi
+
+install_menu
