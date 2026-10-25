@@ -4,7 +4,7 @@ var DashboardHTML = `<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<title>SAHAND MATRIX // Real Packet & Iran DPI Lab</title>
+<title>SAHAND MATRIX // Real Packet & DPI Lab</title>
 <style>
   :root {
     --bg: #0B0F19; --card: #111827; --border: #1E293B;
@@ -78,7 +78,7 @@ var DashboardHTML = `<!DOCTYPE html>
   }
   .raw-line:hover { background: rgba(255,255,255,0.07); }
   .raw-line.crit { color: #FCA5A5; background: rgba(239,68,68,0.08); }
-  .raw-line.warn { color: #FDE68A; }
+  .raw-line.warn { color: #FDE68A; background: rgba(245,158,11,0.06); }
   .raw-line.matched { outline: 1px solid var(--amber); background: rgba(245,158,11,0.25) !important; color: #FFF !important; }
   .port-tag { color: #E2E8F0; font-weight: 700; background: #1E293B; padding: 0 4px; border-radius: 3px; margin-right: 4px; }
   .corr-tag { color: #C084FC; font-weight: 700; margin-right: 4px; }
@@ -94,8 +94,8 @@ var DashboardHTML = `<!DOCTYPE html>
   }
   .stat-bar { display: flex; justify-content: space-between; flex-wrap: wrap; gap: 6px; border-bottom: 1px solid #1E293B; padding-bottom: 5px; margin-bottom: 4px; font-family: monospace; }
   .avg-bar {
-    background: #0F172A; border: 1px solid #1E293B; border-radius: 5px; padding: 4px 8px;
-    margin-bottom: 5px; font-family: monospace; font-size: 11px; display: flex; justify-content: space-between; flex-wrap: wrap;
+    background: #0F172A; border: 1px solid #1E293B; border-radius: 5px; padding: 5px 8px;
+    margin-bottom: 5px; font-family: monospace; font-size: 11px; display: flex; justify-content: space-between; flex-wrap: wrap; gap: 4px;
   }
   .verdict { margin-top: 4px; padding: 5px 8px; border-radius: 5px; background: rgba(56,189,248,0.12); color: #7DD3FC; font-weight: 600; border-left: 3px solid var(--cyan); }
   .verdict.crit { background: rgba(239,68,68,0.18); color: #FECACA; border-left-color: var(--crimson); }
@@ -118,9 +118,9 @@ var DashboardHTML = `<!DOCTYPE html>
     <button id="tabServers" class="btn btn-tab" onclick="showTab('servers')">🖧 Servers & SSH Deploy</button>
   </div>
   <div class="controls">
-    <span style="font-size:11px;color:var(--muted)">S1 (Iran):</span>
+    <span style="font-size:11px;color:var(--muted)">S1 (Entry):</span>
     <select id="s1Select" onchange="setPair()"></select>
-    <span style="font-size:11px;color:var(--muted)">➔ S2 (Kharej):</span>
+    <span style="font-size:11px;color:var(--muted)">➔ S2 (Exit):</span>
     <select id="s2Select" onchange="setPair()"></select>
     <span id="statePill" class="pill">● STOPPED (IDLE)</span>
     <button class="btn btn-start" onclick="ctrlCapture('start')">▶ Start Both</button>
@@ -134,7 +134,7 @@ var DashboardHTML = `<!DOCTYPE html>
     <div class="toolbar">
       <div id="pingBanner"><strong>5-Ping Sync (1h Cache):</strong> Click Pause to measure 5 pings & freeze 150 pkts/window</div>
       <div class="tool-group">
-        <input id="portFilter" placeholder="Ports (e.g. 44995, 10201)" oninput="applyFilters()" style="width:190px;">
+        <input id="portFilter" placeholder="Ports (e.g. 443, 8443)" oninput="applyFilters()" style="width:185px;">
         <button class="btn btn-pause" onclick="lockSnifferPorts()" title="Lock raw kernel sniffer on both servers to ONLY capture these ports">🔒 Lock Sniffer Ports</button>
         <button class="btn" onclick="unlockSnifferPorts()" title="Capture all ports on both servers">🔓 All Ports</button>
         <span id="lockPortBadge" style="font-size:11px;color:var(--emerald);font-weight:700;">[Sniffer: All Ports]</span>
@@ -153,11 +153,11 @@ var DashboardHTML = `<!DOCTYPE html>
     <div class="srv-grid">
       <div class="card">
         <h3 style="font-size:14px;margin-bottom:10px;color:var(--cyan)">+ Add Server (SSH or Manual Agent)</h3>
-        <div class="form-row"><label>Server Name</label><input id="fName" placeholder="e.g. Ireland Kharej S2"></div>
+        <div class="form-row"><label>Server Name</label><input id="fName" placeholder="e.g. Foreign Relay S2"></div>
         <div class="form-row"><label>Server Role</label>
-          <select id="fRole"><option value="kharej">S2: Kharej Server (CP4-CP6)</option><option value="iran">S1: Iran Server (CP1-CP3)</option></select>
+          <select id="fRole"><option value="kharej">S2: Foreign Exit Server (CP4-CP6)</option><option value="iran">S1: Domestic Entry Server (CP1-CP3)</option></select>
         </div>
-        <div class="form-row"><label>Server IP Address</label><input id="fHost" placeholder="e.g. 205.234.152.182"></div>
+        <div class="form-row"><label>Server IP Address</label><input id="fHost" placeholder="e.g. 203.0.113.10"></div>
         <div class="form-row"><label>SSH Port</label><input id="fPort" type="number" value="22"></div>
         <div class="form-row"><label>SSH Username</label><input id="fUser" value="root"></div>
         <div class="form-row"><label>SSH Password (blank if agent installed)</label><input id="fPass" type="password" placeholder="Root password (or blank)"></div>
@@ -330,15 +330,6 @@ function renderMatrix(d) {
 
   d.guides.forEach(g => {
     const allEvs = (d.checkpoints && d.checkpoints[g.id]) || [];
-    let safeCnt = 0, warnCnt = 0, critCnt = 0, sumStealth = 0;
-    allEvs.forEach(e => {
-      sumStealth += e.dpi.stealth_score;
-      if (e.dpi.level === 'CRITICAL') critCnt++;
-      else if (e.dpi.level === 'WARNING') warnCnt++;
-      else safeCnt++;
-    });
-    const avgStealth = allEvs.length ? Math.round(sumStealth / allEvs.length) : 0;
-
     const evs = allEvs.filter(e => {
       if (leaksOnly && e.dpi.level === 'OPTIMAL') return false;
       if (rawTokens.length > 0) {
@@ -348,17 +339,33 @@ function renderMatrix(d) {
       return true;
     });
 
+    // Compute both Byte-Weighted Stealth & Packet-Count Stats on active filtered stream (or full buffer)
+    const statList = evs.length ? evs : allEvs;
+    let safeCnt = 0, warnCnt = 0, critCnt = 0, sumStealth = 0, weightedSum = 0, totalBytes = 0;
+    statList.forEach(e => {
+      const b = Math.max(1, e.length || 1);
+      sumStealth += e.dpi.stealth_score;
+      weightedSum += (e.dpi.stealth_score * b);
+      totalBytes += b;
+      if (e.dpi.level === 'CRITICAL') critCnt++;
+      else if (e.dpi.level === 'WARNING') warnCnt++;
+      else safeCnt++;
+    });
+    const pktAvg = statList.length ? Math.round(sumStealth / statList.length) : 0;
+    const byteWeightedStealth = totalBytes > 0 ? Math.round(weightedSum / totalBytes) : 0;
+    const totalKB = (totalBytes / 1024).toFixed(1);
+
     const last = evs.length ? evs[evs.length - 1] : (allEvs.length ? allEvs[allEvs.length - 1] : null);
     const isCrit = last && last.dpi.level === 'CRITICAL';
     const isWarn = last && last.dpi.level === 'WARNING';
     const protoColor = isCrit ? 'var(--crimson)' : (isWarn ? 'var(--amber)' : 'var(--cyan)');
     const stealthColor = isCrit ? 'var(--crimson)' : (isWarn ? 'var(--amber)' : 'var(--emerald)');
-    const avgColor = avgStealth < 50 ? 'var(--crimson)' : (avgStealth < 80 ? 'var(--amber)' : 'var(--emerald)');
+    const bwColor = byteWeightedStealth < 50 ? 'var(--crimson)' : (byteWeightedStealth < 80 ? 'var(--amber)' : 'var(--emerald)');
     const sPort = last ? splitPort(last.src_addr)[1] : '—';
     const dPort = last ? splitPort(last.dst_addr)[1] : '—';
 
     document.getElementById('row-' + g.id).className = 'cp-row ' + (isCrit ? 'critical' : (isWarn ? 'warning' : ''));
-    document.getElementById('title-' + g.id).innerText = g.title + ' (' + evs.length + '/' + allEvs.length + ' pkts)';
+    document.getElementById('title-' + g.id).innerText = g.title + ' (' + evs.length + '/' + allEvs.length + ' pkts | ' + totalKB + ' KB)';
     document.getElementById('srv-' + g.id).innerText = getServerLabel(d, g.server_role);
 
     const box = document.getElementById('box-' + g.id);
@@ -384,11 +391,11 @@ function renderMatrix(d) {
           '<span>Proto: <strong style="color:' + protoColor + '">' + (last ? last.protocol : '—') + '</strong></span>' +
           '<span>Ports: <strong style="color:#FFF">' + sPort + ' ➔ ' + dPort + '</strong></span>' +
           '<span>Entropy: <strong>' + (last ? last.dpi.shannon_entropy.toFixed(2) + '/8' : '—') + '</strong></span>' +
-          '<span>Last: <strong style="color:' + stealthColor + '">' + (last ? last.dpi.stealth_score + '%' : '—') + '</strong></span>' +
+          '<span>Last Pkt: <strong style="color:' + stealthColor + '">' + (last ? last.dpi.stealth_score + '%' : '—') + '</strong></span>' +
         '</div>' +
         '<div class="avg-bar">' +
-          '<span><strong>Avg Stealth:</strong> <strong style="color:' + avgColor + '">' + (allEvs.length ? avgStealth + '%' : '—') + '</strong></span>' +
-          '<span><span style="color:#7DD3FC">🔵 ' + safeCnt + ' Safe</span> / <span style="color:#FDE68A">🟡 ' + warnCnt + ' Warn</span> / <span style="color:#FCA5A5">🔴 ' + critCnt + ' Red</span> (of ' + allEvs.length + ')</span>' +
+          '<span><strong>Byte-Weighted Stealth:</strong> <strong style="color:' + bwColor + ';font-size:12px;">' + (statList.length ? byteWeightedStealth + '%' : '—') + '</strong> <span style="color:var(--muted)">(Pkt Avg: ' + pktAvg + '%)</span></span>' +
+          '<span><span style="color:#7DD3FC">🔵 ' + safeCnt + '</span> / <span style="color:#FDE68A">🟡 ' + warnCnt + '</span> / <span style="color:#FCA5A5">🔴 ' + critCnt + '</span> (' + totalKB + ' KB)</span>' +
         '</div>' +
         '<div style="color:var(--muted)"><strong>👁 What you see:</strong> ' + g.what_you_see + '</div>' +
         '<div style="color:#6EE7B7"><strong>✓ Safe (Blue):</strong> ' + g.good_for_dpi + '</div>' +
@@ -432,7 +439,7 @@ async function addServer() {
   const res = await fetch('api/nodes/add', {
     method: 'POST', headers: {'Content-Type':'application/json'},
     body: JSON.stringify({
-      name: document.getElementById('fName').value || 'Kharej Node',
+      name: document.getElementById('fName').value || 'Remote Node',
       role: document.getElementById('fRole').value,
       host: document.getElementById('fHost').value,
       ssh_port: parseInt(document.getElementById('fPort').value || '22'),
