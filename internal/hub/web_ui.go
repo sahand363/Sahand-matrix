@@ -42,7 +42,7 @@ var DashboardHTML = `<!DOCTYPE html>
     margin-bottom: 10px; font-size: 12px; background: #111827; padding: 8px 14px;
     border-radius: 8px; border: 1px solid var(--border);
   }
-  .tool-group { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+  .tool-group { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 
   .cp-row {
     display: grid; grid-template-columns: 1.45fr 1fr; gap: 14px;
@@ -54,6 +54,10 @@ var DashboardHTML = `<!DOCTYPE html>
   .cp-left { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
   .cp-top { display: flex; justify-content: space-between; align-items: center; gap: 8px; flex-wrap: wrap; }
   .cp-title { font-size: 13px; font-weight: 700; color: var(--cyan); }
+  .srv-badge {
+    font-size: 11px; font-weight: 700; padding: 2px 7px; border-radius: 4px;
+    background: rgba(168,85,247,0.18); color: #E9D5FF; border: 1px solid #A855F7; margin-left: 6px;
+  }
   .scroll-lock-badge {
     font-size: 10.5px; font-weight: 700; padding: 2px 7px; border-radius: 4px;
     background: rgba(245,158,11,0.2); color: #FDE68A; border: 1px solid var(--amber); display: none;
@@ -128,13 +132,15 @@ var DashboardHTML = `<!DOCTYPE html>
 <div class="wrap">
   <div id="viewMatrix">
     <div class="toolbar">
-      <div id="pingBanner"><strong>5-Ping Sync (1h Cache):</strong> Click Pause to measure 5 pings & freeze up to 150 packets/window</div>
+      <div id="pingBanner"><strong>5-Ping Sync (1h Cache):</strong> Click Pause to measure 5 pings & freeze 150 pkts/window</div>
       <div class="tool-group">
-        <input id="portFilter" placeholder="🔍 Filter Port or IP (e.g. 44995)" oninput="applyFilters()" style="width:195px;">
+        <input id="portFilter" placeholder="Ports (e.g. 44995, 10201)" oninput="applyFilters()" style="width:190px;">
+        <button class="btn btn-pause" onclick="lockSnifferPorts()" title="Lock raw kernel sniffer on both servers to ONLY capture these ports">🔒 Lock Sniffer Ports</button>
+        <button class="btn" onclick="unlockSnifferPorts()" title="Capture all ports on both servers">🔓 All Ports</button>
+        <span id="lockPortBadge" style="font-size:11px;color:var(--emerald);font-weight:700;">[Sniffer: All Ports]</span>
         <label style="cursor:pointer;display:flex;align-items:center;gap:4px;color:#FCA5A5;font-weight:600;">
-          <input type="checkbox" id="leaksOnly" onchange="applyFilters()"> 🔴 Show Flagged/Red Only
+          <input type="checkbox" id="leaksOnly" onchange="applyFilters()"> 🔴 Red Only
         </label>
-        <span style="color:var(--muted)">| Window Size:</span>
         <button class="btn" onclick="setAllHeights(125)">Compact</button>
         <button class="btn" onclick="setAllHeights(240)">Tall</button>
         <button class="btn" onclick="setAllHeights(420)">Max</button>
@@ -199,8 +205,18 @@ function setAllHeights(px) {
   document.querySelectorAll('.raw-box').forEach(b => { b.style.height = px + 'px'; });
 }
 
-function applyFilters() {
-  if (lastData) renderMatrix(lastData);
+function applyFilters() { if (lastData) renderMatrix(lastData); }
+
+async function lockSnifferPorts() {
+  const val = document.getElementById('portFilter').value.trim();
+  await fetch('api/ports?ports=' + encodeURIComponent(val), {method:'POST'});
+  pollState();
+}
+
+async function unlockSnifferPorts() {
+  document.getElementById('portFilter').value = '';
+  await fetch('api/ports?ports=', {method:'POST'});
+  pollState();
 }
 
 function splitPort(addr) {
@@ -213,25 +229,17 @@ function onBoxScroll(cpId) {
   const b = document.getElementById('box-' + cpId);
   if (!b) return;
   const atBottom = (b.scrollHeight - b.scrollTop - b.clientHeight) < 18;
-  if (atBottom) {
-    delete scrollLocks[cpId];
-  } else {
-    scrollLocks[cpId] = Date.now() + 20000;
-  }
+  if (atBottom) delete scrollLocks[cpId];
+  else scrollLocks[cpId] = Date.now() + 20000;
   updateScrollBadge(cpId);
 }
 
 function updateScrollBadge(cpId) {
   const badge = document.getElementById('lock-' + cpId);
   if (!badge) return;
-  const exp = scrollLocks[cpId] || 0;
-  const rem = Math.ceil((exp - Date.now()) / 1000);
-  if (rem > 0) {
-    badge.style.display = 'inline-block';
-    badge.innerText = '⏸ Scroll Locked (' + rem + 's)';
-  } else {
-    badge.style.display = 'none';
-  }
+  const rem = Math.ceil(((scrollLocks[cpId] || 0) - Date.now()) / 1000);
+  badge.style.display = rem > 0 ? 'inline-block' : 'none';
+  if (rem > 0) badge.innerText = '⏸ Scroll Locked (' + rem + 's)';
 }
 
 setInterval(() => { [1,2,3,4,5,6].forEach(updateScrollBadge); }, 1000);
@@ -243,7 +251,7 @@ function ensureSkeleton(guides) {
     '<div class="cp-row" id="row-' + g.id + '">' +
       '<div class="cp-left">' +
         '<div class="cp-top">' +
-          '<div><span class="cp-title" id="title-' + g.id + '">' + g.title + '</span> <span class="scroll-lock-badge" id="lock-' + g.id + '"></span></div>' +
+          '<div><span class="cp-title" id="title-' + g.id + '">' + g.title + '</span><span class="srv-badge" id="srv-' + g.id + '"></span> <span class="scroll-lock-badge" id="lock-' + g.id + '"></span></div>' +
           '<span class="dpi-badge ' + (g.dpi_visible ? 'crit' : 'safe') + '">' + g.dpi_zone + '</span>' +
         '</div>' +
         '<div class="raw-box" id="box-' + g.id + '"></div>' +
@@ -279,7 +287,7 @@ async function setPair() {
 async function toggleSmartPause() {
   const btn = document.getElementById('pauseBtn');
   if (!isPaused) {
-    btn.innerText = '⚡ Checking 5 Pings (or 1h Cache)...';
+    btn.innerText = '⚡ Checking 5 Pings...';
     const res = await fetch('api/pause-burst');
     lastData = await res.json();
     isPaused = true;
@@ -292,11 +300,24 @@ async function toggleSmartPause() {
   }
 }
 
+function getServerLabel(d, role) {
+  const nodes = d.nodes || [];
+  const targetId = role === 'iran' ? d.active_s1 : d.active_s2;
+  const found = nodes.find(n => n.id === targetId);
+  if (!found) return role.toUpperCase();
+  return (role === 'iran' ? 'S1: ' : 'S2: ') + found.name + ' (' + found.host + ')';
+}
+
 function renderMatrix(d) {
   ensureSkeleton(d.guides);
   const pill = document.getElementById('statePill');
   pill.className = (!isPaused && d.capturing) ? 'pill live' : 'pill';
   pill.innerText = isPaused ? ('⏸ PAUSED (+' + (d.ping ? d.ping.offset_ms.toFixed(1) : '0.0') + 'ms)') : (d.capturing ? '● CAPTURING REAL PACKETS' : '● STOPPED (PRESS START)');
+
+  const lp = d.locked_ports || [];
+  const lBadge = document.getElementById('lockPortBadge');
+  lBadge.innerText = lp.length ? ('[🔒 Locked Ports: ' + lp.join(', ') + ']') : '[Sniffer: All Ports]';
+  lBadge.style.color = lp.length ? 'var(--amber)' : 'var(--emerald)';
 
   if (d.ping && d.ping.average_ms > 0) {
     const src = d.ping.used_cached ? 'Cached <1h' : 'Fresh 5-Ping';
@@ -304,7 +325,7 @@ function renderMatrix(d) {
       '<strong>5-Ping (' + src + '):</strong> [' + d.ping.samples_ms.map(x=>x.toFixed(1)).join(', ') + '] ms ➔ <strong>Avg: ' + d.ping.average_ms.toFixed(1) + 'ms | Offset: +' + d.ping.offset_ms.toFixed(1) + 'ms</strong>';
   }
 
-  const pFilter = (document.getElementById('portFilter').value || '').trim().toLowerCase();
+  const rawTokens = (document.getElementById('portFilter').value || '').split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
   const leaksOnly = document.getElementById('leaksOnly').checked;
 
   d.guides.forEach(g => {
@@ -320,7 +341,10 @@ function renderMatrix(d) {
 
     const evs = allEvs.filter(e => {
       if (leaksOnly && e.dpi.level === 'OPTIMAL') return false;
-      if (pFilter && !(e.src_addr.toLowerCase().includes(pFilter) || e.dst_addr.toLowerCase().includes(pFilter) || e.correlation_tag.toLowerCase().includes(pFilter))) return false;
+      if (rawTokens.length > 0) {
+        const hay = (e.src_addr + ' ' + e.dst_addr + ' ' + e.correlation_tag + ' ' + e.protocol).toLowerCase();
+        if (!rawTokens.some(tok => hay.includes(tok))) return false;
+      }
       return true;
     });
 
@@ -335,6 +359,7 @@ function renderMatrix(d) {
 
     document.getElementById('row-' + g.id).className = 'cp-row ' + (isCrit ? 'critical' : (isWarn ? 'warning' : ''));
     document.getElementById('title-' + g.id).innerText = g.title + ' (' + evs.length + '/' + allEvs.length + ' pkts)';
+    document.getElementById('srv-' + g.id).innerText = getServerLabel(d, g.server_role);
 
     const box = document.getElementById('box-' + g.id);
     const prevTop = box.scrollTop;
@@ -348,13 +373,10 @@ function renderMatrix(d) {
         '<span class="corr-tag">[' + e.correlation_tag + ']</span>' +
         '<span class="port-tag">Port ' + sp + '➔' + dp + '</span>' +
         '[#' + e.sequence_num + ' ' + e.src_addr + '➔' + e.dst_addr + ' | ' + e.length + 'B] ' + e.raw_byte_log.replace(/</g,'&lt;') + '</div>';
-    }).join('') : '<div style="color:#64748B">No matching packets. Click [▶ Start Both] or clear filters...</div>';
+    }).join('') : '<div style="color:#64748B">No matching packets. Click [▶ Start Both] or adjust port filter...</div>';
 
-    if (d.capturing && !isPaused && !isLocked) {
-      box.scrollTop = box.scrollHeight;
-    } else {
-      box.scrollTop = prevTop;
-    }
+    if (d.capturing && !isPaused && !isLocked) box.scrollTop = box.scrollHeight;
+    else box.scrollTop = prevTop;
 
     document.getElementById('right-' + g.id).innerHTML =
       '<div>' +
