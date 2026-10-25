@@ -22,7 +22,6 @@ func main() {
 
 	sniffer := agent.NewRealSniffer(*role, *serverID, *peerIP, 9444)
 
-	// Start raw socket capture loop in background (starts in STOPPED/Idle state until Start is pressed)
 	go func() {
 		if err := sniffer.RunCaptureLoop(); err != nil {
 			log.Printf("[sahand-agent] Raw capture warning: %v", err)
@@ -32,14 +31,10 @@ func main() {
 	authMiddleware := func(next http.HandlerFunc) http.HandlerFunc {
 		return func(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Access-Control-Allow-Origin", "*")
-			if *token != "" && r.Header.Get("X-Sahand-Token") != *token && r.URL.Query().Get("token") != *token {
-				// Allow local browser UI access if token not enforced on root
-			}
 			next(w, r)
 		}
 	}
 
-	// 1. Real 5-Ping Calibration Responder
 	http.HandleFunc("/api/ping", authMiddleware(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]any{
@@ -50,11 +45,13 @@ func main() {
 		})
 	}))
 
-	// 2. Start / Stop Control Endpoint (Starts Stopped by default)
 	http.HandleFunc("/api/control", authMiddleware(func(w http.ResponseWriter, r *http.Request) {
 		action := r.URL.Query().Get("action")
 		if peer := r.URL.Query().Get("peer"); peer != "" {
 			sniffer.SetPeerIP(peer)
+		}
+		if r.URL.Query().Has("ports") {
+			sniffer.SetPortFilterCSV(r.URL.Query().Get("ports"))
 		}
 		if action == "start" {
 			sniffer.Start()
@@ -63,24 +60,24 @@ func main() {
 		}
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]any{
-			"capturing": sniffer.IsRunning(),
-			"role":      *role,
+			"capturing":    sniffer.IsRunning(),
+			"role":         *role,
+			"locked_ports": sniffer.GetLockedPorts(),
 		})
 	}))
 
-	// 3. Real Captured Packet Snapshot (3 Local Checkpoints)
 	http.HandleFunc("/api/snapshot", authMiddleware(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]any{
-			"server_id":   *serverID,
-			"role":        *role,
-			"capturing":   sniffer.IsRunning(),
-			"checkpoints": sniffer.GetSnapshot(),
-			"guides":      analyzer.AllCheckpointGuides(),
+			"server_id":    *serverID,
+			"role":         *role,
+			"capturing":    sniffer.IsRunning(),
+			"locked_ports": sniffer.GetLockedPorts(),
+			"checkpoints":  sniffer.GetSnapshot(),
+			"guides":       analyzer.AllCheckpointGuides(),
 		})
 	}))
 
-	// 4. Local 3-Window Node Web Page (Matches Main Hub with zero transit lag)
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		_, _ = fmt.Fprint(w, agentLocalHTML)
@@ -97,7 +94,7 @@ const agentLocalHTML = `<!DOCTYPE html>
   .bar { display:flex; justify-content:space-between; align-items:center; background:#111827; padding:14px 18px; border-radius:10px; border:1px solid #1E293B; margin-bottom:16px; }
   .btn { padding:8px 16px; border-radius:6px; border:1px solid #38BDF8; background:#0D1322; color:#38BDF8; cursor:pointer; font-weight:bold; }
   .row { display:grid; grid-template-columns: 1.6fr 1fr; gap:14px; background:#111827; border:1px solid #1E293B; border-radius:10px; padding:14px; margin-bottom:12px; }
-  .stream { background:#060911; padding:10px; border-radius:6px; height:110px; overflow-y:auto; font-size:12px; color:#7DD3FC; }
+  .stream { background:#060911; padding:10px; border-radius:6px; height:120px; overflow-y:auto; font-size:12px; color:#7DD3FC; resize:vertical; }
 </style></head><body>
 <div class="bar">
   <div><strong id="hdr">SAHAND LOCAL AGENT // 3-WINDOW REAL CAPTURE</strong></div>
@@ -132,5 +129,5 @@ async function poll() {
       '</div></div>';
   }).join('');
 }
-setInterval(poll, 700); poll();
+setInterval(poll, 800); poll();
 </script></body></html>`
