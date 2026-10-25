@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"sync"
@@ -71,7 +72,6 @@ func runDaemonServer(port, secret, token string) {
 	baseRoute := fmt.Sprintf("/matrix/%s", strings.Trim(secret, "/"))
 	mux := http.NewServeMux()
 
-	// 1. Start / Stop Both Servers
 	mux.HandleFunc(baseRoute+"/api/control", func(w http.ResponseWriter, r *http.Request) {
 		action := r.URL.Query().Get("action")
 		if action == "start" {
@@ -79,12 +79,20 @@ func runDaemonServer(port, secret, token string) {
 		} else {
 			hc.localSniff.Stop()
 		}
-		hc.forwardRemoteControl(action)
+		hc.forwardRemoteQuery("action=" + url.QueryEscape(action))
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]any{"capturing": hc.localSniff.IsRunning()})
 	})
 
-	// 2. Select Active S1 (Iran) & S2 (Kharej) Server Pair
+	// Lock or Unlock Sniffer-Level Ports across Both Servers (S1 & S2)
+	mux.HandleFunc(baseRoute+"/api/ports", func(w http.ResponseWriter, r *http.Request) {
+		portsCSV := r.URL.Query().Get("ports")
+		locked := hc.localSniff.SetPortFilterCSV(portsCSV)
+		hc.forwardRemoteQuery("ports=" + url.QueryEscape(portsCSV))
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"locked_ports": locked})
+	})
+
 	mux.HandleFunc(baseRoute+"/api/pair", func(w http.ResponseWriter, r *http.Request) {
 		hc.mu.Lock()
 		if s1 := r.URL.Query().Get("s1"); s1 != "" {
@@ -100,7 +108,6 @@ func runDaemonServer(port, secret, token string) {
 		w.WriteHeader(http.StatusOK)
 	})
 
-	// 3. Add Remote Server via SSH (or Manual IP if password left blank)
 	mux.HandleFunc(baseRoute+"/api/nodes/add", func(w http.ResponseWriter, r *http.Request) {
 		var req struct {
 			Name     string `json:"name"`
@@ -127,7 +134,6 @@ func runDaemonServer(port, secret, token string) {
 		_ = json.NewEncoder(w).Encode(node)
 	})
 
-	// 4. Delete Server Card from List
 	mux.HandleFunc(baseRoute+"/api/nodes/delete", func(w http.ResponseWriter, r *http.Request) {
 		id := r.URL.Query().Get("id")
 		hc.nodeMgr.DeleteNode(id)
@@ -139,7 +145,6 @@ func runDaemonServer(port, secret, token string) {
 		w.WriteHeader(http.StatusOK)
 	})
 
-	// 5. Trigger Automated SSH Binary Deployment (0% -> 100%)
 	mux.HandleFunc(baseRoute+"/api/nodes/deploy", func(w http.ResponseWriter, r *http.Request) {
 		id := r.URL.Query().Get("id")
 		hubHost := strings.Split(r.Host, ":")[0]
@@ -147,7 +152,6 @@ func runDaemonServer(port, secret, token string) {
 		w.WriteHeader(http.StatusOK)
 	})
 
-	// 6. Smart 5-Ping Pause (Uses 1-Hour Cache or Runs 5 Real Pings)
 	mux.HandleFunc(baseRoute+"/api/pause-burst", func(w http.ResponseWriter, r *http.Request) {
 		targetHost := hc.getS2HostPort()
 		report := hc.syncEngine.GetOrMeasure5Pings(targetHost, hc.token, false)
@@ -157,12 +161,10 @@ func runDaemonServer(port, secret, token string) {
 		hc.writeMergedState(w)
 	})
 
-	// 7. Live Merged 6-Checkpoint Real Packet State
 	mux.HandleFunc(baseRoute+"/api/state", func(w http.ResponseWriter, r *http.Request) {
 		hc.writeMergedState(w)
 	})
 
-	// 8. Serve Main Dashboard
 	mux.HandleFunc(baseRoute+"/", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		_, _ = w.Write([]byte(hub.DashboardHTML))
@@ -182,18 +184,18 @@ func (hc *HubCoordinator) getS2HostPort() string {
 	return "127.0.0.1:9444"
 }
 
-func (hc *HubCoordinator) forwardRemoteControl(action string) {
+func (hc *HubCoordinator) forwardRemoteQuery(query string) {
 	for _, n := range hc.nodeMgr.ListNodes() {
 		if n.ID == "local-s1" {
 			continue
 		}
-		url := fmt.Sprintf("http://%s:%d/api/control?action=%s", n.Host, n.AgentPort, action)
-		go func(u string) {
-			resp, err := hc.httpClient.Get(u)
+		u := fmt.Sprintf("http://%s:%d/api/control?%s", n.Host, n.AgentPort, query)
+		go func(target string) {
+			resp, err := hc.httpClient.Get(target)
 			if err == nil {
 				_ = resp.Body.Close()
 			}
-		}(url)
+		}(u)
 	}
 }
 
@@ -222,12 +224,13 @@ func (hc *HubCoordinator) writeMergedState(w http.ResponseWriter) {
 
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]any{
-		"capturing":   hc.localSniff.IsRunning(),
-		"checkpoints": merged,
-		"guides":      analyzer.AllCheckpointGuides(),
-		"nodes":       hc.nodeMgr.ListNodes(),
-		"active_s1":   s1,
-		"active_s2":   s2,
-		"ping":        ping,
+		"capturing":    hc.localSniff.IsRunning(),
+		"locked_ports": hc.localSniff.GetLockedPorts(),
+		"checkpoints":  merged,
+		"guides":       analyzer.AllCheckpointGuides(),
+		"nodes":        hc.nodeMgr.ListNodes(),
+		"active_s1":    s1,
+		"active_s2":    s2,
+		"ping":         ping,
 	})
 }
