@@ -1,6 +1,7 @@
 package main
 
 import (
+	"crypto/subtle"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -35,12 +36,14 @@ type HubCoordinator struct {
 func main() {
 	daemonMode := flag.Bool("daemon", false, "Run as background systemd Hub & Web Panel service")
 	port := flag.String("port", "8443", "Secure web panel port")
-	secretPath := flag.String("secret", "sahand-default", "Dynamic secret URL path")
+	secretPath := flag.String("secret", "sahand-default", "Persistent secret URL path")
 	token := flag.String("token", "", "Shared agent authentication token")
+	authUser := flag.String("auth-user", "", "Optional HTTP Basic Auth username (blank = disabled)")
+	authPass := flag.String("auth-pass", "", "Optional HTTP Basic Auth password (blank = disabled)")
 	flag.Parse()
 
 	if *daemonMode {
-		runDaemonServer(*port, *secretPath, *token)
+		runDaemonServer(*port, *secretPath, *token, *authUser, *authPass)
 		return
 	}
 
@@ -51,7 +54,7 @@ func main() {
 	}
 }
 
-func runDaemonServer(port, secret, token string) {
+func runDaemonServer(port, secret, token, authUser, authPass string) {
 	sniffer := agent.NewRealSniffer("iran", "local-s1", "", 8443)
 	go func() {
 		if err := sniffer.RunCaptureLoop(); err != nil {
@@ -69,10 +72,26 @@ func runDaemonServer(port, secret, token string) {
 		httpClient: &http.Client{Timeout: 1800 * time.Millisecond},
 	}
 
+	guard := func(next http.HandlerFunc) http.HandlerFunc {
+		return func(w http.ResponseWriter, r *http.Request) {
+			if authUser != "" && authPass != "" {
+				u, p, ok := r.BasicAuth()
+				uOk := subtle.ConstantTimeCompare([]byte(u), []byte(authUser)) == 1
+				pOk := subtle.ConstantTimeCompare([]byte(p), []byte(authPass)) == 1
+				if !ok || !uOk || !pOk {
+					w.Header().Set("WWW-Authenticate", `Basic realm="Sahand Matrix Hub"`)
+					http.Error(w, "Unauthorized", http.StatusUnauthorized)
+					return
+				}
+			}
+			next(w, r)
+		}
+	}
+
 	baseRoute := fmt.Sprintf("/matrix/%s", strings.Trim(secret, "/"))
 	mux := http.NewServeMux()
 
-	mux.HandleFunc(baseRoute+"/api/control", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc(baseRoute+"/api/control", guard(func(w http.ResponseWriter, r *http.Request) {
 		action := r.URL.Query().Get("action")
 		if action == "start" {
 			hc.localSniff.Start()
@@ -82,18 +101,17 @@ func runDaemonServer(port, secret, token string) {
 		hc.forwardRemoteQuery("action=" + url.QueryEscape(action))
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]any{"capturing": hc.localSniff.IsRunning()})
-	})
+	}))
 
-	// Lock or Unlock Sniffer-Level Ports across Both Servers (S1 & S2)
-	mux.HandleFunc(baseRoute+"/api/ports", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc(baseRoute+"/api/ports", guard(func(w http.ResponseWriter, r *http.Request) {
 		portsCSV := r.URL.Query().Get("ports")
 		locked := hc.localSniff.SetPortFilterCSV(portsCSV)
 		hc.forwardRemoteQuery("ports=" + url.QueryEscape(portsCSV))
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]any{"locked_ports": locked})
-	})
+	}))
 
-	mux.HandleFunc(baseRoute+"/api/pair", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc(baseRoute+"/api/pair", guard(func(w http.ResponseWriter, r *http.Request) {
 		hc.mu.Lock()
 		if s1 := r.URL.Query().Get("s1"); s1 != "" {
 			hc.activeS1 = s1
@@ -106,9 +124,9 @@ func runDaemonServer(port, secret, token string) {
 		}
 		hc.mu.Unlock()
 		w.WriteHeader(http.StatusOK)
-	})
+	}))
 
-	mux.HandleFunc(baseRoute+"/api/nodes/add", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc(baseRoute+"/api/nodes/add", guard(func(w http.ResponseWriter, r *http.Request) {
 		var req struct {
 			Name     string `json:"name"`
 			Role     string `json:"role"`
@@ -132,9 +150,9 @@ func runDaemonServer(port, secret, token string) {
 		}
 		hc.mu.Unlock()
 		_ = json.NewEncoder(w).Encode(node)
-	})
+	}))
 
-	mux.HandleFunc(baseRoute+"/api/nodes/delete", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc(baseRoute+"/api/nodes/delete", guard(func(w http.ResponseWriter, r *http.Request) {
 		id := r.URL.Query().Get("id")
 		hc.nodeMgr.DeleteNode(id)
 		hc.mu.Lock()
@@ -143,34 +161,34 @@ func runDaemonServer(port, secret, token string) {
 		}
 		hc.mu.Unlock()
 		w.WriteHeader(http.StatusOK)
-	})
+	}))
 
-	mux.HandleFunc(baseRoute+"/api/nodes/deploy", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc(baseRoute+"/api/nodes/deploy", guard(func(w http.ResponseWriter, r *http.Request) {
 		id := r.URL.Query().Get("id")
 		hubHost := strings.Split(r.Host, ":")[0]
 		hc.nodeMgr.DeployAgentAsync(id, hubHost, hc.token)
 		w.WriteHeader(http.StatusOK)
-	})
+	}))
 
-	mux.HandleFunc(baseRoute+"/api/pause-burst", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc(baseRoute+"/api/pause-burst", guard(func(w http.ResponseWriter, r *http.Request) {
 		targetHost := hc.getS2HostPort()
 		report := hc.syncEngine.GetOrMeasure5Pings(targetHost, hc.token, false)
 		hc.mu.Lock()
 		hc.lastPing = report
 		hc.mu.Unlock()
 		hc.writeMergedState(w)
-	})
+	}))
 
-	mux.HandleFunc(baseRoute+"/api/state", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc(baseRoute+"/api/state", guard(func(w http.ResponseWriter, r *http.Request) {
 		hc.writeMergedState(w)
-	})
+	}))
 
-	mux.HandleFunc(baseRoute+"/", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc(baseRoute+"/", guard(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		_, _ = w.Write([]byte(hub.DashboardHTML))
-	})
+	}))
 
-	log.Printf("[sahand-hub] Real Packet Lab active on :%s%s/", port, baseRoute)
+	log.Printf("[sahand-hub] Main Server Lab active on :%s%s/", port, baseRoute)
 	log.Fatal(hub.ListenDualHTTPAndTLS("0.0.0.0:"+port, mux))
 }
 
@@ -189,7 +207,7 @@ func (hc *HubCoordinator) forwardRemoteQuery(query string) {
 		if n.ID == "local-s1" {
 			continue
 		}
-		u := fmt.Sprintf("http://%s:%d/api/control?%s", n.Host, n.AgentPort, query)
+		u := fmt.Sprintf("http://%s:%d/api/control?%s&token=%s", n.Host, n.AgentPort, query, url.QueryEscape(hc.token))
 		go func(target string) {
 			resp, err := hc.httpClient.Get(target)
 			if err == nil {
@@ -201,13 +219,13 @@ func (hc *HubCoordinator) forwardRemoteQuery(query string) {
 
 func (hc *HubCoordinator) writeMergedState(w http.ResponseWriter) {
 	merged := hc.localSniff.GetSnapshot()
-
 	hc.mu.RLock()
 	s1, s2, ping := hc.activeS1, hc.activeS2, hc.lastPing
 	hc.mu.RUnlock()
 
 	if n, ok := hc.nodeMgr.GetNode(s2); ok && n.ID != "local-s1" {
-		resp, err := hc.httpClient.Get(fmt.Sprintf("http://%s:%d/api/snapshot", n.Host, n.AgentPort))
+		u := fmt.Sprintf("http://%s:%d/api/snapshot?token=%s", n.Host, n.AgentPort, url.QueryEscape(hc.token))
+		resp, err := hc.httpClient.Get(u)
 		if err == nil {
 			var remoteSnap struct {
 				Checkpoints map[models.CheckpointID][]models.PacketEvent `json:"checkpoints"`
