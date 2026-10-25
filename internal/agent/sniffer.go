@@ -4,6 +4,8 @@ import (
 	"encoding/binary"
 	"fmt"
 	"net"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -16,23 +18,25 @@ import (
 const MaxHistoryPerCheckpoint = 150
 
 type RealSniffer struct {
-	mu          sync.RWMutex
-	role        string // "iran" (S1) or "kharej" (S2)
-	serverID    string
-	peerIP      string // IP of the paired server (S2 IP on Iran, or S1 IP on Kharej)
-	excludePort uint16
-	isRunning   atomic.Bool
-	seqCounter  uint64
-	latestByCP  map[models.CheckpointID][]models.PacketEvent
+	mu           sync.RWMutex
+	role         string // "iran" (S1) or "kharej" (S2)
+	serverID     string
+	peerIP       string
+	excludePort  uint16
+	allowedPorts map[uint16]bool // If non-empty, ONLY capture packets matching these ports
+	isRunning    atomic.Bool
+	seqCounter   uint64
+	latestByCP   map[models.CheckpointID][]models.PacketEvent
 }
 
 func NewRealSniffer(role, serverID, peerIP string, excludePort uint16) *RealSniffer {
 	return &RealSniffer{
-		role:        role,
-		serverID:    serverID,
-		peerIP:      peerIP,
-		excludePort: excludePort,
-		latestByCP:  make(map[models.CheckpointID][]models.PacketEvent),
+		role:         role,
+		serverID:     serverID,
+		peerIP:       peerIP,
+		excludePort:  excludePort,
+		allowedPorts: make(map[uint16]bool),
+		latestByCP:   make(map[models.CheckpointID][]models.PacketEvent),
 	}
 }
 
@@ -44,6 +48,39 @@ func (s *RealSniffer) SetPeerIP(ip string) {
 	s.mu.Lock()
 	s.peerIP = ip
 	s.mu.Unlock()
+}
+
+// SetPortFilterCSV parses comma-separated ports (e.g. "44995, 10201") and locks the raw sniffer to them.
+// If csv is empty, it unlocks the sniffer to capture all ports. Also clears old buffers so you see fresh matches.
+func (s *RealSniffer) SetPortFilterCSV(csv string) []uint16 {
+	allowed := make(map[uint16]bool)
+	var list []uint16
+	for _, part := range strings.Split(csv, ",") {
+		pStr := strings.TrimSpace(part)
+		if pStr == "" {
+			continue
+		}
+		if v, err := strconv.Atoi(pStr); err == nil && v > 0 && v <= 65535 {
+			port := uint16(v)
+			allowed[port] = true
+			list = append(list, port)
+		}
+	}
+	s.mu.Lock()
+	s.allowedPorts = allowed
+	s.latestByCP = make(map[models.CheckpointID][]models.PacketEvent)
+	s.mu.Unlock()
+	return list
+}
+
+func (s *RealSniffer) GetLockedPorts() []uint16 {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	var list []uint16
+	for p := range s.allowedPorts {
+		list = append(list, p)
+	}
+	return list
 }
 
 func (s *RealSniffer) GetSnapshot() map[models.CheckpointID][]models.PacketEvent {
@@ -85,7 +122,7 @@ func (s *RealSniffer) parseFrame(frame []byte) {
 	}
 	ip := frame[14:]
 	ihl := int(ip[0]&0x0F) * 4
-	if len(ip) < ihl || ip[9] != 6 { // TCP
+	if len(ip) < ihl || ip[9] != 6 {
 		return
 	}
 	srcIP := net.IP(ip[12:16]).String()
@@ -102,6 +139,19 @@ func (s *RealSniffer) parseFrame(frame []byte) {
 		return
 	}
 
+	// Check Sniffer-Level Port Lock if user locked specific ports
+	s.mu.RLock()
+	hasLock := len(s.allowedPorts) > 0
+	portMatch := s.allowedPorts[srcPort] || s.allowedPorts[dstPort]
+	role := s.role
+	cp2Len := len(s.latestByCP[models.CP2_IranTunnelCore])
+	cp5Len := len(s.latestByCP[models.CP5_KharejDecrypted])
+	s.mu.RUnlock()
+
+	if hasLock && !portMatch {
+		return
+	}
+
 	dataOffset := int(tcp[12]>>4) * 4
 	if len(tcp) <= dataOffset {
 		return
@@ -115,17 +165,9 @@ func (s *RealSniffer) parseFrame(frame []byte) {
 	cp := s.classifyCheckpoint(srcIP, dstIP, srcPort, dstPort)
 	s.recordPacket(cp, srcIP, dstIP, srcPort, dstPort, payload, now)
 
-	// If S1 (Iran) relays without 127.0.0.1 loopback (e.g. direct socket relay / iptables / X-UI bridge),
-	// also mirror the internal relay handoff into CP2 (or CP5 on Kharej) if CP2/CP5 has no loopback traffic.
-	s.mu.RLock()
-	role := s.role
-	cp2Len := len(s.latestByCP[models.CP2_IranTunnelCore])
-	cp5Len := len(s.latestByCP[models.CP5_KharejDecrypted])
-	s.mu.RUnlock()
-
-	if role == "iran" && cp == models.CP3_IranBorderEgress && cp2Len < 5 {
+	if role == "iran" && (cp == models.CP1_IranClientIngress || cp == models.CP3_IranBorderEgress) && cp2Len < 25 {
 		s.recordPacket(models.CP2_IranTunnelCore, "127.0.0.1", dstIP, srcPort, dstPort, payload, now)
-	} else if role == "kharej" && cp == models.CP6_KharejInternetOut && cp5Len < 5 {
+	} else if role == "kharej" && (cp == models.CP4_KharejTransitIn || cp == models.CP6_KharejInternetOut) && cp5Len < 25 {
 		s.recordPacket(models.CP5_KharejDecrypted, "127.0.0.1", dstIP, srcPort, dstPort, payload, now)
 	}
 }
@@ -135,7 +177,6 @@ func (s *RealSniffer) recordPacket(cp models.CheckpointID, srcIP, dstIP string, 
 	dpi := analyzer.EvaluateDPIRisk(cp, payload, tlsMeta)
 	seq := atomic.AddUint64(&s.seqCounter, 1)
 
-	// Correlation tag groups packets occurring in the same 250ms time bucket & size tier across all 6 windows
 	timeBucket := (now.UnixMilli() / 250) % 1000
 	sizeBucket := (len(payload) / 64) * 64
 	corrTag := fmt.Sprintf("B%03d-S%d", timeBucket, sizeBucket)
