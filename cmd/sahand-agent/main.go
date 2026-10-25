@@ -16,7 +16,7 @@ func main() {
 	role := flag.String("role", "kharej", "Server role: 'iran' (CP1-CP3) or 'kharej' (CP4-CP6)")
 	serverID := flag.String("id", "node-kharej", "Unique Server Node ID")
 	peerIP := flag.String("peer", "", "Peer Server IP to classify CP3/CP4 transit traffic")
-	token := flag.String("token", "", "Shared authentication token")
+	_ = flag.String("token", "", "Shared authentication token")
 	listenAddr := flag.String("listen", ":9444", "Agent API & 3-Window Local Web UI port")
 	flag.Parse()
 
