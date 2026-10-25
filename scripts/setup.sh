@@ -130,7 +130,7 @@ download_or_build_binaries() {
   go mod tidy
   CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o "${INSTALL_DIR}/sahand-hub" ./cmd/sahand-hub
   CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o "${INSTALL_DIR}/sahand-agent" ./cmd/sahand-agent
-  cp -f "$tmp_dir/scripts/install.sh" "${INSTALL_DIR}/sahand-menu"
+  cp -f "$tmp_dir/scripts/setup.sh" "${INSTALL_DIR}/sahand-menu"
   chmod +x "${INSTALL_DIR}/sahand-hub" "${INSTALL_DIR}/sahand-agent" "${INSTALL_DIR}/sahand-menu"
   rm -rf "$tmp_dir"
 }
