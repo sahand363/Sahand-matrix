@@ -169,7 +169,7 @@ func runDaemonServer(port, secret, token, authUser, authPass string) {
 		}
 		hc.mu.Unlock()
 		w.WriteHeader(http.StatusOK)
-	})
+	})) // <-- ensure this closing brace and parenthesis are followed by a comma if needed, or closed properly
 
 	mux.HandleFunc(baseRoute+"/api/nodes/deploy", guard(func(w http.ResponseWriter, r *http.Request) {
 		id := r.URL.Query().Get("id")
