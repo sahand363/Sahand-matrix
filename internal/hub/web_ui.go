@@ -21,15 +21,15 @@ var DashboardHTML = `<!DOCTYPE html>
     display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 10px;
     position: sticky; top: 0; z-index: 30;
   }
-  .brand { font-size: 15px; font-weight: 700; display: flex; align-items: center; gap: 8px; }
-  .controls { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .brand { font-size: 15px; font-weight: 700; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .controls { display: flex; align-items: center; gap: 7px; flex-wrap: wrap; }
   select, input {
     background: #070B14; color: var(--text); border: 1px solid var(--border);
     padding: 6px 10px; border-radius: 6px; font-size: 12px;
   }
   .btn {
     padding: 6px 10px; border-radius: 6px; font-size: 12px; font-weight: 600; cursor: pointer;
-    border: 1px solid var(--border); background: var(--card); color: var(--text);
+    border: 1px solid var(--border); background: var(--card); color: var(--text); text-decoration: none;
   }
   .btn:hover { filter: brightness(1.15); }
   .btn-start { border-color: var(--emerald); color: var(--emerald); background: rgba(16,185,129,0.12); }
@@ -130,16 +130,19 @@ var DashboardHTML = `<!DOCTYPE html>
     <button id="tabMatrix" class="btn btn-tab active" onclick="showTab('matrix')">6-Window Matrix</button>
     <button id="tabServers" class="btn btn-tab" onclick="showTab('servers')">🖧 Servers & SSH Deploy</button>
     <button id="langBtn" class="btn" onclick="toggleLang()">🌐 فارسی / EN</button>
+    <button id="updBtn" class="btn btn-pause" onclick="triggerUpdate()" title="Pull latest from GitHub & rebuild">🚀 Update</button>
   </div>
   <div class="controls">
     <span id="lblS1" style="font-size:11px;color:var(--muted)">Main Server:</span>
     <select id="s1Select" onchange="setPair()"></select>
     <span id="lblS2" style="font-size:11px;color:var(--muted)">➔ Server 2 / 3:</span>
     <select id="s2Select" onchange="setPair()"></select>
+    <span id="timerPill" class="pill" style="border-color:var(--cyan);color:var(--cyan);">⏱ 10:00</span>
     <span id="statePill" class="pill">● STOPPED</span>
     <button id="btnStart" class="btn btn-start" onclick="ctrlCapture('start')">▶ Start Both</button>
     <button id="btnStop" class="btn btn-stop" onclick="ctrlCapture('stop')">■ Stop Both</button>
-    <button id="pauseBtn" class="btn btn-pause" onclick="toggleSmartPause()">⏸ 5-Ping Sync Pause</button>
+    <button id="pauseBtn" class="btn btn-pause" onclick="toggleSmartPause()">⏸ 5-Ping Pause</button>
+    <a href="logout" class="btn btn-stop" title="Stop sniffer, wipe session credentials & lock">🔒 Logout</a>
   </div>
 </header>
 
@@ -152,7 +155,7 @@ var DashboardHTML = `<!DOCTYPE html>
         <button id="btnLockP" class="btn btn-pause" onclick="lockSnifferPorts()">🔒 Lock Ports</button>
         <button id="btnAllP" class="btn" onclick="unlockSnifferPorts()">🔓 All</button>
         <span id="lockPortBadge" class="ltr" style="font-size:11px;color:var(--emerald);font-weight:700;">[All Ports]</span>
-        <button class="btn" onclick="resetCumulativeStats()" title="Reset cumulative session stealth counters in browser memory">↺ Reset Stats</button>
+        <button class="btn" onclick="resetCumulativeStats()">↺ Reset Stats</button>
         <button class="btn" onclick="toggleWrapLines()" id="wrapBtn">↩ Wrap Lines</button>
         <label style="cursor:pointer;display:flex;align-items:center;gap:4px;color:#FCA5A5;font-weight:600;">
           <input type="checkbox" id="leaksOnly" onchange="applyFilters()"> <span id="lblRedOnly">🔴 Red</span>
@@ -168,7 +171,7 @@ var DashboardHTML = `<!DOCTYPE html>
   <div id="viewServers" style="display:none;">
     <div class="srv-grid">
       <div class="card">
-        <h3 style="font-size:14px;margin-bottom:10px;color:var(--cyan)">+ Add Server 2 / Server 3 (SSH or Sentinel)</h3>
+        <h3 style="font-size:14px;margin-bottom:10px;color:var(--cyan)">+ Add Server 2 / Server 3 (Zero-Trace Ephemeral SSH)</h3>
         <div class="form-row"><label>Server Label</label><input id="fName" placeholder="e.g. Server 2 (Relay/Exit)"></div>
         <div class="form-row"><label>Server Role</label>
           <select id="fRole"><option value="kharej">Server 2 / Server 3 (Transit/Exit CP4-CP6)</option><option value="iran">Main Server (Entry CP1-CP3)</option></select>
@@ -176,7 +179,7 @@ var DashboardHTML = `<!DOCTYPE html>
         <div class="form-row"><label>Server IP Address</label><input id="fHost" class="ltr" placeholder="e.g. 203.0.113.10"></div>
         <div class="form-row"><label>SSH Port</label><input id="fPort" class="ltr" type="number" value="22"></div>
         <div class="form-row"><label>SSH Username</label><input id="fUser" class="ltr" value="root"></div>
-        <div class="form-row"><label>SSH Password (blank if Sentinel installed)</label><input id="fPass" type="password" placeholder="Root password (or blank)"></div>
+        <div class="form-row"><label>SSH Password (wiped from RAM after deploy)</label><input id="fPass" type="password" placeholder="Root password (or blank)"></div>
         <button class="btn btn-start" style="width:100%;margin-top:4px;" onclick="addServer()">🔗 Save & Connect Server</button>
         <div id="addMsg" style="font-size:11px;margin-top:8px;color:var(--amber)"></div>
       </div>
@@ -198,14 +201,45 @@ function initCum(id) {
 function resetCumulativeStats() { Object.keys(cumStats).forEach(k => delete cumStats[k]); if (lastData) renderMatrix(lastData); }
 function toggleWrapLines() { document.body.classList.toggle('wrap-lines'); }
 
+// Hybrid HTTP/HTTPS Clipboard Copy Function
+function copyLine(ev) {
+  ev.stopPropagation();
+  const btn = ev.currentTarget || ev.target;
+  const raw = btn.parentElement.innerText.replace('📋 Copy', '').replace('✓ Copied', '').trim();
+  const done = () => { btn.innerText = '✓ Copied'; setTimeout(() => { btn.innerText = '📋 Copy'; }, 1200); };
+  if (navigator.clipboard && window.isSecureContext) {
+    navigator.clipboard.writeText(raw).then(done).catch(() => fallbackCopy(raw, done));
+  } else {
+    fallbackCopy(raw, done);
+  }
+}
+function fallbackCopy(text, cb) {
+  const ta = document.createElement('textarea');
+  ta.value = text;
+  ta.style.position = 'fixed'; ta.style.left = '-9999px';
+  document.body.appendChild(ta);
+  ta.focus(); ta.select();
+  try { document.execCommand('copy'); cb(); } catch (e) {}
+  document.body.removeChild(ta);
+}
+
+async function triggerUpdate() {
+  const b = document.getElementById('updBtn');
+  if (!confirm('Pull latest Sahand Matrix from GitHub, rebuild binaries, and restart service?')) return;
+  b.innerText = '⏳ Updating (12s)...';
+  b.disabled = true;
+  try { await fetch('api/update', {method:'POST'}); } catch (e) {}
+  setTimeout(() => { window.location.reload(); }, 12000);
+}
+
 function entropyBadge(last, cpId) {
   if (!last) return '—';
   const h = last.dpi.shannon_entropy.toFixed(2) + '/8';
-  if (cpId === 2 || cpId === 5) return '<strong>' + h + '</strong><span class="ent-tag ent-ok" title="Internal Server RAM: Invisible to external ISP DPI">' + (lang==='fa'?'🔵 رم داخلی':'🔵 Internal RAM') + '</span>';
-  if (last.dpi.level === 'OPTIMAL') return '<strong>' + h + '</strong><span class="ent-tag ent-ok" title="6.5–7.98 inside TLS framing is normal HTTPS encryption (Safe)">' + (lang==='fa'?'🟢 نرمال HTTPS':'🟢 HTTPS Norm') + '</span>';
-  if (last.length <= 24) return '<strong>' + h + '</strong><span class="ent-tag ent-warn" title="Small TCP keep-alive or control frame">' + (lang==='fa'?'🟡 بسته کنترلی':'🟡 Control Tick') + '</span>';
-  if (last.dpi.shannon_entropy > 7.1) return '<strong>' + h + '</strong><span class="ent-tag ent-crit" title="High entropy (>7.1) WITHOUT a TLS header looks like raw Shadowsocks/Cipher!">' + (lang==='fa'?'🔴 ریسک بدون TLS':'🔴 Unframed Cipher') + '</span>';
-  return '<strong>' + h + '</strong><span class="ent-tag ent-crit" title="Low entropy (<6.5) without TLS indicates readable plaintext!">' + (lang==='fa'?'🔴 متن آشکار':'🔴 Plaintext Risk') + '</span>';
+  if (cpId === 2 || cpId === 5) return '<strong>' + h + '</strong><span class="ent-tag ent-ok">' + (lang==='fa'?'🔵 رم داخلی':'🔵 Internal RAM') + '</span>';
+  if (last.dpi.level === 'OPTIMAL') return '<strong>' + h + '</strong><span class="ent-tag ent-ok">' + (lang==='fa'?'🟢 نرمال HTTPS':'🟢 HTTPS Norm') + '</span>';
+  if (last.length <= 24) return '<strong>' + h + '</strong><span class="ent-tag ent-warn">' + (lang==='fa'?'🟡 بسته کنترلی':'🟡 Control Tick') + '</span>';
+  if (last.dpi.shannon_entropy > 7.1) return '<strong>' + h + '</strong><span class="ent-tag ent-crit">' + (lang==='fa'?'🔴 ریسک بدون TLS':'🔴 Unframed Cipher') + '</span>';
+  return '<strong>' + h + '</strong><span class="ent-tag ent-crit">' + (lang==='fa'?'🔴 متن آشکار':'🔴 Plaintext Risk') + '</span>';
 }
 
 document.addEventListener('mousemove', e => {
@@ -231,8 +265,6 @@ function toggleLang() {
   document.body.classList.toggle('rtl', lang === 'fa');
   document.getElementById('tabMatrix').innerText = lang==='fa' ? 'ماتریس ۶ پنجره‌ای' : '6-Window Matrix';
   document.getElementById('tabServers').innerText = lang==='fa' ? '🖧 مدیریت سرورها' : '🖧 Servers & SSH Deploy';
-  document.getElementById('lblS1').innerText = lang==='fa' ? 'سرور اصلی:' : 'Main Server:';
-  document.getElementById('lblS2').innerText = lang==='fa' ? '➔ سرور ۲ / ۳:' : '➔ Server 2 / 3:';
   if (lastData) renderMatrix(lastData);
 }
 
@@ -244,14 +276,6 @@ function showTab(t) {
 }
 
 function selectTag(tag) { selectedTag = (selectedTag === tag) ? '' : tag; if (lastData) renderMatrix(lastData); }
-function copyLine(ev) {
-  ev.stopPropagation();
-  const btn = ev.target;
-  const lineText = btn.parentElement.innerText.replace('📋 Copy', '').replace('✓ Copied', '').trim();
-  navigator.clipboard.writeText(lineText);
-  btn.innerText = '✓ Copied';
-  setTimeout(() => { btn.innerText = '📋 Copy'; }, 1200);
-}
 function setAllHeights(px) { document.querySelectorAll('.raw-box').forEach(b => { b.style.height = px + 'px'; }); }
 function applyFilters() { if (lastData) renderMatrix(lastData); }
 async function lockSnifferPorts() { resetCumulativeStats(); await fetch('api/ports?ports=' + encodeURIComponent(document.getElementById('portFilter').value.trim()), {method:'POST'}); pollState(); }
@@ -314,10 +338,10 @@ async function toggleSmartPause() {
     lastData = await res.json();
     isPaused = true;
     renderMatrix(lastData);
-    btn.innerText = lang==='fa' ? '▶ ادامه جریان زنده' : '▶ Resume Live Stream';
+    btn.innerText = '▶ Resume';
   } else {
     isPaused = false;
-    btn.innerText = '⏸ 5-Ping Sync Pause';
+    btn.innerText = '⏸ 5-Ping Pause';
     pollState();
   }
 }
@@ -335,7 +359,11 @@ function renderMatrix(d) {
   ensureSkeleton(d.guides);
   const pill = document.getElementById('statePill');
   pill.className = (!isPaused && d.capturing) ? 'pill live' : 'pill';
-  pill.innerText = isPaused ? ('⏸ PAUSED (+' + (d.ping ? d.ping.offset_ms.toFixed(1) : '0.0') + 'ms)') : (d.capturing ? '● CAPTURING REAL PACKETS' : '● STOPPED');
+  pill.innerText = isPaused ? ('⏸ PAUSED (+' + (d.ping ? d.ping.offset_ms.toFixed(1) : '0.0') + 'ms)') : (d.capturing ? '● CAPTURING' : '● STOPPED');
+
+  const remS = d.auto_stop_s || 0;
+  const mm = String(Math.floor(remS / 60)).padStart(2, '0'), ss = String(remS % 60).padStart(2, '0');
+  document.getElementById('timerPill').innerText = '⏱ Auto-Stop: ' + mm + ':' + ss;
 
   const lp = d.locked_ports || [];
   const lBadge = document.getElementById('lockPortBadge');
@@ -403,7 +431,7 @@ function renderMatrix(d) {
       const sp = splitPort(e.src_addr)[1], dp = splitPort(e.dst_addr)[1];
       const cls = (e.dpi.level === 'CRITICAL' ? 'crit' : (e.dpi.level === 'WARNING' ? 'warn' : '')) + (selectedTag && e.correlation_tag === selectedTag ? ' matched' : '');
       return '<div class="raw-line ' + cls + '" onclick="selectTag(\'' + e.correlation_tag + '\')">' +
-        '<button class="copy-btn" onclick="copyLine(event)">📋 Copy</button>' +
+        '<button type="button" class="copy-btn" onclick="copyLine(event)">📋 Copy</button>' +
         '<span class="corr-tag">[' + e.correlation_tag + ']</span>' +
         '<span class="port-tag">Port ' + sp + '➔' + dp + '</span>' +
         '[#' + e.sequence_num + ' ' + e.src_addr + '➔' + e.dst_addr + ' | ' + e.length + 'B] ' + e.raw_byte_log.replace(/</g,'&lt;') + '</div>';
@@ -480,7 +508,8 @@ async function addServer() {
     })
   });
   const d = await res.json();
-  msg.innerText = d.error ? ('Error: ' + d.error) : '✓ Server saved!';
+  document.getElementById('fPass').value = '';
+  msg.innerText = d.error ? ('Error: ' + d.error) : '✓ Server saved (Password cleared from form)!';
   pollState();
 }
 
@@ -491,6 +520,7 @@ async function pollState() {
   if (isPaused) return;
   try {
     const res = await fetch('api/state');
+    if (res.status === 401) { window.location.reload(); return; }
     lastData = await res.json();
     renderMatrix(lastData);
     renderNodes(lastData.nodes || [], lastData.active_s1, lastData.active_s2);
