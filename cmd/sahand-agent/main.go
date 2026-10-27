@@ -18,7 +18,7 @@ func main() {
 	role := flag.String("role", "kharej", "Node role: 'iran' (Main Server CP1-CP3) or 'kharej' (Server 2 CP4-CP6)")
 	serverID := flag.String("id", "server-2", "Unique Server Node ID")
 	peerIP := flag.String("peer", "", "Peer Server IP to classify CP3/CP4 transit traffic")
-	token := flag.String("token", "", "Optional shared token for Hub API calls")
+	_ = flag.String("token", "", "Optional shared token for Hub API calls")
 	secretPath := flag.String("secret", "", "Optional persistent secret URL path for Sentinel Web UI")
 	authUser := flag.String("auth-user", "", "Optional HTTP Basic Auth username (blank = disabled)")
 	authPass := flag.String("auth-pass", "", "Optional HTTP Basic Auth password (blank = disabled)")
@@ -33,17 +33,9 @@ func main() {
 		}
 	}()
 
-	apiGuard := func(next http.HandlerFunc) http.HandlerFunc {
+	cors := func(next http.HandlerFunc) http.HandlerFunc {
 		return func(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Access-Control-Allow-Origin", "*")
-			if *token != "" {
-				qTok := r.URL.Query().Get("token")
-				hTok := r.Header.Get("X-Sahand-Token")
-				if qTok != "" && qTok != *token && hTok != *token {
-					http.Error(w, "Unauthorized token", http.StatusUnauthorized)
-					return
-				}
-			}
 			next(w, r)
 		}
 	}
@@ -64,7 +56,7 @@ func main() {
 		}
 	}
 
-	http.HandleFunc("/api/ping", apiGuard(func(w http.ResponseWriter, r *http.Request) {
+	http.HandleFunc("/api/ping", cors(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"server_id":      *serverID,
@@ -74,7 +66,7 @@ func main() {
 		})
 	}))
 
-	http.HandleFunc("/api/control", apiGuard(func(w http.ResponseWriter, r *http.Request) {
+	http.HandleFunc("/api/control", cors(func(w http.ResponseWriter, r *http.Request) {
 		action := r.URL.Query().Get("action")
 		if peer := r.URL.Query().Get("peer"); peer != "" {
 			sniffer.SetPeerIP(peer)
@@ -95,7 +87,7 @@ func main() {
 		})
 	}))
 
-	http.HandleFunc("/api/snapshot", apiGuard(func(w http.ResponseWriter, r *http.Request) {
+	http.HandleFunc("/api/snapshot", cors(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"server_id":    *serverID,
@@ -107,16 +99,16 @@ func main() {
 		})
 	}))
 
-	uiPath := "/"
-	if s := strings.Trim(*secretPath, "/"); s != "" {
-		uiPath = "/sentinel/" + s + "/"
-	}
-	http.HandleFunc(uiPath, uiGuard(func(w http.ResponseWriter, r *http.Request) {
+	serveUI := uiGuard(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		_, _ = fmt.Fprint(w, agentSentinelHTML)
-	}))
+	})
+	http.HandleFunc("/", serveUI)
+	if s := strings.Trim(*secretPath, "/"); s != "" {
+		http.HandleFunc("/sentinel/"+s+"/", serveUI)
+	}
 
-	log.Printf("[sahand-sentinel] (%s) active on %s%s [Default: STOPPED]", *role, *listenAddr, uiPath)
+	log.Printf("[sahand-sentinel] (%s) active on %s", *role, *listenAddr)
 	log.Fatal(http.ListenAndServe(*listenAddr, nil))
 }
 
@@ -136,10 +128,20 @@ const agentSentinelHTML = `<!DOCTYPE html>
   .btn:hover { filter:brightness(1.15); }
   .btn-start { border-color:var(--emerald); color:var(--emerald); background:rgba(16,185,129,0.12); }
   .btn-stop { border-color:var(--crimson); color:var(--crimson); background:rgba(239,68,68,0.12); }
+  .pill { font-size:11px; font-weight:700; padding:5px 10px; border-radius:14px; border:1px solid var(--amber); color:var(--amber); }
+  .pill.live { border-color:var(--emerald); color:var(--emerald); background:rgba(16,185,129,0.1); }
   input { background:#070B14; color:var(--text); border:1px solid var(--border); padding:6px 10px; border-radius:6px; font-size:12px; }
   .cp-row { display:flex; gap:0; align-items:flex-start; background:var(--card); border:1px solid var(--border); border-left:4px solid var(--emerald); border-radius:10px; padding:11px 14px; margin-bottom:10px; }
   .cp-row.critical { border-color:var(--crimson); border-left-width:5px; background:rgba(239,68,68,0.04); }
+  .cp-row.warning { border-left-color:var(--amber); }
   .cp-left { width:var(--left-col); min-width:30%; max-width:85%; display:flex; flex-direction:column; gap:6px; flex-shrink:0; }
+  .cp-top { display:flex; justify-content:space-between; align-items:center; gap:8px; flex-wrap:wrap; }
+  .cp-title { font-size:13px; font-weight:700; color:var(--cyan); }
+  .srv-badge { font-size:11px; font-weight:700; padding:2px 7px; border-radius:4px; background:rgba(168,85,247,0.18); color:#E9D5FF; border:1px solid #A855F7; margin:0 5px; }
+  .scroll-lock-badge { font-size:10.5px; font-weight:700; padding:2px 7px; border-radius:4px; background:rgba(245,158,11,0.2); color:#FDE68A; border:1px solid var(--amber); display:none; }
+  .dpi-badge { font-size:10.5px; font-weight:700; padding:2px 8px; border-radius:5px; }
+  .dpi-badge.crit { background:rgba(239,68,68,0.2); color:#FCA5A5; border:1px solid var(--crimson); }
+  .dpi-badge.safe { background:rgba(16,185,129,0.15); color:var(--emerald); border:1px solid var(--emerald); }
   .splitter { width:10px; align-self:stretch; cursor:col-resize; display:flex; align-items:center; justify-content:center; margin:0 5px; border-radius:4px; background:rgba(255,255,255,0.03); color:#64748B; font-size:11px; user-select:none; }
   .splitter:hover { background:rgba(56,189,248,0.25); color:#FFF; }
   .cp-right { flex:1; min-width:180px; background:#0A0E19; border:1px solid var(--border); border-radius:8px; padding:9px 12px; display:flex; flex-direction:column; justify-content:flex-start; gap:6px; font-size:11.5px; line-height:1.42; }
@@ -152,13 +154,16 @@ const agentSentinelHTML = `<!DOCTYPE html>
   .corr-tag { color:#C084FC; font-weight:700; margin-right:4px; }
   .copy-btn { font-size:10px; background:#1E293B; color:#CBD5E1; border:none; border-radius:3px; padding:0 5px; cursor:pointer; margin-right:6px; }
   .stat-bar, .avg-bar { display:flex; justify-content:space-between; flex-wrap:wrap; gap:6px; font-family:monospace; direction:ltr; }
-  .avg-bar { background:#0F172A; border:1px solid var(--border); border-radius:5px; padding:5px 8px; }
+  .stat-bar { border-bottom:1px solid #1E293B; padding-bottom:5px; margin-bottom:4px; }
+  .avg-bar { background:#0F172A; border:1px solid var(--border); border-radius:5px; padding:5px 8px; margin-bottom:5px; font-size:11px; }
   .verdict { margin-top:2px; padding:5px 8px; border-radius:5px; background:rgba(56,189,248,0.12); color:#7DD3FC; font-weight:600; border-left:3px solid var(--cyan); }
   .verdict.crit { background:rgba(239,68,68,0.18); color:#FECACA; border-left-color:var(--crimson); }
+  .verdict.warn { background:rgba(245,158,11,0.16); color:#FDE68A; border-left-color:var(--amber); }
 </style></head><body>
 <header>
-  <div><strong id="hdr" style="color:var(--cyan);font-size:15px;">❖ SAHAND SENTINEL // 3-WINDOW NODE</strong> <span id="lockBadge" style="font-size:11px;color:var(--emerald)">[All Ports]</span></div>
+  <div><strong id="hdr" style="color:var(--cyan);font-size:15px;">❖ SAHAND SENTINEL // 3-WINDOW NODE</strong></div>
   <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
+    <span id="statePill" class="pill">● STOPPED</span>
     <button class="btn btn-start" onclick="ctrl('start')">▶ Start Capture</button>
     <button class="btn btn-stop" onclick="ctrl('stop')">■ Stop Capture</button>
     <button class="btn" onclick="toggleLang()">🌐 فارسی / EN</button>
@@ -166,11 +171,12 @@ const agentSentinelHTML = `<!DOCTYPE html>
 </header>
 <div class="wrap">
   <div class="toolbar">
-    <div><strong>Drag ⋮ bar</strong> between columns to widen packet lines, or scroll horizontally</div>
+    <div><strong>Drag ⋮ bar</strong> between columns to widen packet lines, or scroll horizontally inside any box</div>
     <div style="display:flex;gap:7px;align-items:center;flex-wrap:wrap;">
       <input id="pInp" class="ltr" placeholder="Ports (e.g. 443, 8443)" style="width:165px">
       <button class="btn" onclick="lockP()">🔒 Lock Ports</button>
       <button class="btn" onclick="unlockP()">🔓 All</button>
+      <span id="lockBadge" class="ltr" style="font-size:11px;color:var(--emerald);font-weight:700;">[All Ports]</span>
       <button class="btn" onclick="resetCum()">↺ Reset Stats</button>
       <button class="btn" onclick="document.body.classList.toggle('wrap-lines')">↩ Wrap Lines</button>
       <button class="btn" onclick="setH(135)">Compact</button>
@@ -202,15 +208,20 @@ async function unlockP() { document.getElementById('pInp').value=''; resetCum();
 async function poll() {
   const res = await fetch('/api/snapshot');
   const d = await res.json();
-  const roleName = d.role === 'iran' ? (lang==='fa'?'سرور اصلی (Main Server)':'Main Server (S1)') : (lang==='fa'?'سرور ۲ (Server 2)':'Server 2 (S2)');
+  const roleStr = (d.role || 'kharej').toLowerCase();
+  const roleName = roleStr === 'iran' ? 'Main Server (S1)' : 'Server 2 (S2)';
   document.getElementById('hdr').innerHTML = '❖ SAHAND SENTINEL // <bdi>' + d.server_id + '</bdi> — ' + roleName;
+  const pill = document.getElementById('statePill');
+  pill.className = d.capturing ? 'pill live' : 'pill';
+  pill.innerText = d.capturing ? '● CAPTURING REAL PACKETS' : '● STOPPED';
   const lp = d.locked_ports || [];
   document.getElementById('lockBadge').innerText = lp.length ? ('[🔒 Ports: '+lp.join(',')+']') : '[All Ports]';
-  const guides = (d.guides || []).filter(g => g.server_role === d.role);
+  let guides = (d.guides || []).filter(g => g.server_role === roleStr);
+  if (!guides.length) guides = (d.guides || []).slice(3, 6);
   if (!init && guides.length) {
     init = true;
     document.getElementById('list').innerHTML = guides.map(g =>
-      '<div class="cp-row" id="r-'+g.id+'"><div class="cp-left"><div style="display:flex;justify-content:space-between;"><strong id="t-'+g.id+'" style="color:var(--cyan);font-size:13px;"></strong> <span id="lk-'+g.id+'" style="color:var(--amber);font-size:11px"></span></div><div class="raw-box" id="b-'+g.id+'"></div></div><div class="splitter" onmousedown="drag=true">⋮</div><div class="cp-right" id="ri-'+g.id+'"></div></div>'
+      '<div class="cp-row" id="r-'+g.id+'"><div class="cp-left"><div class="cp-top"><div><span class="cp-title" id="t-'+g.id+'"></span><bdi class="srv-badge">'+roleName+'</bdi><bdi class="scroll-lock-badge" id="lk-'+g.id+'"></bdi></div><span class="dpi-badge '+(g.dpi_visible?'crit':'safe')+'">'+g.dpi_zone+'</span></div><div class="raw-box" id="b-'+g.id+'"></div></div><div class="splitter" onmousedown="drag=true">⋮</div><div class="cp-right" id="ri-'+g.id+'"></div></div>'
     ).join('');
     guides.forEach(g => {
       const b = document.getElementById('b-'+g.id);
@@ -232,16 +243,19 @@ async function poll() {
     const totalMB = cs.bytes >= 1048576 ? (cs.bytes/1048576).toFixed(2)+' MB' : (cs.bytes/1024).toFixed(1)+' KB';
     const last = evs[evs.length-1];
     const isCrit = last && last.dpi.level==='CRITICAL';
-    document.getElementById('r-'+g.id).className = 'cp-row' + (isCrit?' critical':'');
+    const isWarn = last && last.dpi.level==='WARNING';
+    document.getElementById('r-'+g.id).className = 'cp-row ' + (isCrit?'critical':(isWarn?'warning':''));
     document.getElementById('t-'+g.id).innerHTML = '<bdi>'+g.title+' ('+evs.length+' in buf | '+totalMB+' analyzed)</bdi>';
     const rem = Math.ceil(((locks[g.id]||0)-Date.now())/1000);
-    document.getElementById('lk-'+g.id).innerText = rem>0 ? ('⏸ Scroll Locked ('+rem+'s)') : '';
+    const lkEl = document.getElementById('lk-'+g.id);
+    lkEl.style.display = rem>0 ? 'inline-block' : 'none';
+    if (rem>0) lkEl.innerText = '⏸ Scroll Locked ('+rem+'s)';
     const box = document.getElementById('b-'+g.id);
     const top = box.scrollTop, left = box.scrollLeft;
-    box.innerHTML = evs.length ? evs.map(e => '<div class="raw-line '+(e.dpi.level==='CRITICAL'?'crit':(e.dpi.level==='WARNING'?'warn':''))+'"><button class="copy-btn" onclick="copyLine(event)">📋 Copy</button><span class="corr-tag">['+e.correlation_tag+']</span><span class="port-tag">Port '+spPort(e.src_addr)+'➔'+spPort(e.dst_addr)+'</span>[#'+e.sequence_num+' '+e.src_addr+'➔'+e.dst_addr+' | '+e.length+'B] '+e.raw_byte_log.replace(/</g,'&lt;')+'</div>').join('') : '<div style="color:#64748B">Waiting for packets...</div>';
+    box.innerHTML = evs.length ? evs.map(e => '<div class="raw-line '+(e.dpi.level==='CRITICAL'?'crit':(e.dpi.level==='WARNING'?'warn':''))+'"><button class="copy-btn" onclick="copyLine(event)">📋 Copy</button><span class="corr-tag">['+e.correlation_tag+']</span><span class="port-tag">Port '+spPort(e.src_addr)+'➔'+spPort(e.dst_addr)+'</span>[#'+e.sequence_num+' '+e.src_addr+'➔'+e.dst_addr+' | '+e.length+'B] '+e.raw_byte_log.replace(/</g,'&lt;')+'</div>').join('') : '<div style="color:#64748B">No matching packets. Click [▶ Start Capture]...</div>';
     if (d.capturing && rem<=0) box.scrollTop = box.scrollHeight; else box.scrollTop = top;
     box.scrollLeft = left;
-    document.getElementById('ri-'+g.id).innerHTML = '<div><div class="stat-bar"><span>Proto: <strong>'+(last?last.protocol:'—')+'</strong></span><span>Entropy: <strong>'+(last?last.dpi.shannon_entropy.toFixed(2)+'/8':'—')+'</strong></span></div><div class="avg-bar"><span><strong>Session Stealth: <bdi style="color:var(--emerald)">'+bw+'%</bdi></strong></span><span><bdi>🔵 '+cs.safe+' / 🟡 '+cs.warn+' / 🔴 '+cs.crit+' ('+totalMB+')</bdi></span></div><div style="margin-top:6px;color:var(--muted)">'+g.what_you_see+'</div><div style="color:#6EE7B7">'+g.good_for_dpi+'</div><div style="color:#FCA5A5">'+g.bad_for_dpi+'</div></div><div class="verdict '+(isCrit?'crit':'')+'"><bdi>'+(last?last.dpi.explanation:'Idle — Waiting for real packet stream.')+'</bdi></div>';
+    document.getElementById('ri-'+g.id).innerHTML = '<div><div class="stat-bar"><span>Proto: <strong>'+(last?last.protocol:'—')+'</strong></span><span>Ports: <strong>'+(last?spPort(last.src_addr)+' ➔ '+spPort(last.dst_addr):'—')+'</strong></span><span>Entropy: <strong>'+(last?last.dpi.shannon_entropy.toFixed(2)+'/8':'—')+'</strong></span></div><div class="avg-bar"><span><strong>Session Stealth: <bdi style="color:var(--emerald)">'+(cs.bytes?bw+'%':'—')+'</bdi></strong></span><span><bdi>🔵 '+cs.safe+' / 🟡 '+cs.warn+' / 🔴 '+cs.crit+' ('+totalMB+')</bdi></span></div><div style="color:var(--muted)"><strong>👁 What you see:</strong> '+g.what_you_see+'</div><div style="color:#6EE7B7"><strong>✓ Safe (Blue):</strong> '+g.good_for_dpi+'</div><div style="color:#FCA5A5"><strong>✗ Exposed (Red):</strong> '+g.bad_for_dpi+'</div></div><div class="verdict '+(isCrit?'crit':(isWarn?'warn':''))+'"><bdi>'+(last?(last.dpi.color_meaning+' — '+last.dpi.explanation):'Idle — Waiting for real packet stream.')+'</bdi></div>';
   });
 }
 setInterval(poll, 900); poll();
