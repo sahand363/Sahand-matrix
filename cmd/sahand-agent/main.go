@@ -142,6 +142,10 @@ const agentSentinelHTML = `<!DOCTYPE html>
   .dpi-badge { font-size:10.5px; font-weight:700; padding:2px 8px; border-radius:5px; }
   .dpi-badge.crit { background:rgba(239,68,68,0.2); color:#FCA5A5; border:1px solid var(--crimson); }
   .dpi-badge.safe { background:rgba(16,185,129,0.15); color:var(--emerald); border:1px solid var(--emerald); }
+  .ent-tag { font-size:10px; font-weight:700; padding:1px 6px; border-radius:4px; margin-left:4px; cursor:help; }
+  .ent-ok { background:rgba(16,185,129,0.16); color:#6EE7B7; border:1px solid var(--emerald); }
+  .ent-warn { background:rgba(245,158,11,0.16); color:#FDE68A; border:1px solid var(--amber); }
+  .ent-crit { background:rgba(239,68,68,0.2); color:#FCA5A5; border:1px solid var(--crimson); }
   .splitter { width:10px; align-self:stretch; cursor:col-resize; display:flex; align-items:center; justify-content:center; margin:0 5px; border-radius:4px; background:rgba(255,255,255,0.03); color:#64748B; font-size:11px; user-select:none; }
   .splitter:hover { background:rgba(56,189,248,0.25); color:#FFF; }
   .cp-right { flex:1; min-width:180px; background:#0A0E19; border:1px solid var(--border); border-radius:8px; padding:9px 12px; display:flex; flex-direction:column; justify-content:flex-start; gap:6px; font-size:11.5px; line-height:1.42; }
@@ -153,7 +157,7 @@ const agentSentinelHTML = `<!DOCTYPE html>
   .port-tag { color:#E2E8F0; font-weight:700; background:#1E293B; padding:0 4px; border-radius:3px; margin-right:4px; }
   .corr-tag { color:#C084FC; font-weight:700; margin-right:4px; }
   .copy-btn { font-size:10px; background:#1E293B; color:#CBD5E1; border:none; border-radius:3px; padding:0 5px; cursor:pointer; margin-right:6px; }
-  .stat-bar, .avg-bar { display:flex; justify-content:space-between; flex-wrap:wrap; gap:6px; font-family:monospace; direction:ltr; }
+  .stat-bar, .avg-bar { display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:6px; font-family:monospace; direction:ltr; }
   .stat-bar { border-bottom:1px solid #1E293B; padding-bottom:5px; margin-bottom:4px; }
   .avg-bar { background:#0F172A; border:1px solid var(--border); border-radius:5px; padding:5px 8px; margin-bottom:5px; font-size:11px; }
   .verdict { margin-top:2px; padding:5px 8px; border-radius:5px; background:rgba(56,189,248,0.12); color:#7DD3FC; font-weight:600; border-left:3px solid var(--cyan); }
@@ -171,7 +175,7 @@ const agentSentinelHTML = `<!DOCTYPE html>
 </header>
 <div class="wrap">
   <div class="toolbar">
-    <div><strong>Drag ⋮ bar</strong> between columns to widen packet lines, or scroll horizontally inside any box</div>
+    <div><strong>Entropy Guide:</strong> <span class="ent-tag ent-ok">🟢 6.5–7.98 + TLS = Safe HTTPS</span> <span class="ent-tag ent-crit">🔴 >7.1 No TLS = Raw Cipher Risk</span></div>
     <div style="display:flex;gap:7px;align-items:center;flex-wrap:wrap;">
       <input id="pInp" class="ltr" placeholder="Ports (e.g. 443, 8443)" style="width:165px">
       <button class="btn" onclick="lockP()">🔒 Lock Ports</button>
@@ -189,6 +193,15 @@ const agentSentinelHTML = `<!DOCTYPE html>
 <script>
 let lang = 'en', init = false, drag = false;
 const locks = {}, cum = {};
+function entBadge(last, cpId) {
+  if (!last) return '—';
+  const h = last.dpi.shannon_entropy.toFixed(2) + '/8';
+  if (cpId === 2 || cpId === 5) return '<strong>' + h + '</strong><span class="ent-tag ent-ok">' + (lang==='fa'?'🔵 رم داخلی':'🔵 Internal RAM') + '</span>';
+  if (last.dpi.level === 'OPTIMAL') return '<strong>' + h + '</strong><span class="ent-tag ent-ok">' + (lang==='fa'?'🟢 نرمال HTTPS':'🟢 HTTPS Norm') + '</span>';
+  if (last.length <= 24) return '<strong>' + h + '</strong><span class="ent-tag ent-warn">' + (lang==='fa'?'🟡 کنترلی':'🟡 Control Tick') + '</span>';
+  if (last.dpi.shannon_entropy > 7.1) return '<strong>' + h + '</strong><span class="ent-tag ent-crit">' + (lang==='fa'?'🔴 بدون TLS':'🔴 Unframed Cipher') + '</span>';
+  return '<strong>' + h + '</strong><span class="ent-tag ent-crit">' + (lang==='fa'?'🔴 متن آشکار':'🔴 Plaintext Risk') + '</span>';
+}
 document.addEventListener('mousemove', e => {
   if (!drag) return;
   const w = document.querySelector('.wrap').getBoundingClientRect();
@@ -255,7 +268,7 @@ async function poll() {
     box.innerHTML = evs.length ? evs.map(e => '<div class="raw-line '+(e.dpi.level==='CRITICAL'?'crit':(e.dpi.level==='WARNING'?'warn':''))+'"><button class="copy-btn" onclick="copyLine(event)">📋 Copy</button><span class="corr-tag">['+e.correlation_tag+']</span><span class="port-tag">Port '+spPort(e.src_addr)+'➔'+spPort(e.dst_addr)+'</span>[#'+e.sequence_num+' '+e.src_addr+'➔'+e.dst_addr+' | '+e.length+'B] '+e.raw_byte_log.replace(/</g,'&lt;')+'</div>').join('') : '<div style="color:#64748B">No matching packets. Click [▶ Start Capture]...</div>';
     if (d.capturing && rem<=0) box.scrollTop = box.scrollHeight; else box.scrollTop = top;
     box.scrollLeft = left;
-    document.getElementById('ri-'+g.id).innerHTML = '<div><div class="stat-bar"><span>Proto: <strong>'+(last?last.protocol:'—')+'</strong></span><span>Ports: <strong>'+(last?spPort(last.src_addr)+' ➔ '+spPort(last.dst_addr):'—')+'</strong></span><span>Entropy: <strong>'+(last?last.dpi.shannon_entropy.toFixed(2)+'/8':'—')+'</strong></span></div><div class="avg-bar"><span><strong>Session Stealth: <bdi style="color:var(--emerald)">'+(cs.bytes?bw+'%':'—')+'</bdi></strong></span><span><bdi>🔵 '+cs.safe+' / 🟡 '+cs.warn+' / 🔴 '+cs.crit+' ('+totalMB+')</bdi></span></div><div style="color:var(--muted)"><strong>👁 What you see:</strong> '+g.what_you_see+'</div><div style="color:#6EE7B7"><strong>✓ Safe (Blue):</strong> '+g.good_for_dpi+'</div><div style="color:#FCA5A5"><strong>✗ Exposed (Red):</strong> '+g.bad_for_dpi+'</div></div><div class="verdict '+(isCrit?'crit':(isWarn?'warn':''))+'"><bdi>'+(last?(last.dpi.color_meaning+' — '+last.dpi.explanation):'Idle — Waiting for real packet stream.')+'</bdi></div>';
+    document.getElementById('ri-'+g.id).innerHTML = '<div><div class="stat-bar"><span>Proto: <strong>'+(last?last.protocol:'—')+'</strong></span><span>Ports: <strong>'+(last?spPort(last.src_addr)+' ➔ '+spPort(last.dst_addr):'—')+'</strong></span><span>Entropy: '+entBadge(last, g.id)+'</span></div><div class="avg-bar"><span><strong>Session Stealth: <bdi style="color:var(--emerald)">'+(cs.bytes?bw+'%':'—')+'</bdi></strong></span><span><bdi>🔵 '+cs.safe+' / 🟡 '+cs.warn+' / 🔴 '+cs.crit+' ('+totalMB+')</bdi></span></div><div style="color:var(--muted)"><strong>👁 What you see:</strong> '+g.what_you_see+'</div><div style="color:#6EE7B7"><strong>✓ Safe (Blue):</strong> '+g.good_for_dpi+'</div><div style="color:#FCA5A5"><strong>✗ Exposed (Red):</strong> '+g.bad_for_dpi+'</div></div><div class="verdict '+(isCrit?'crit':(isWarn?'warn':''))+'"><bdi>'+(last?(last.dpi.color_meaning+' — '+last.dpi.explanation):'Idle — Waiting for real packet stream.')+'</bdi></div>';
   });
 }
 setInterval(poll, 900); poll();
