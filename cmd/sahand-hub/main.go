@@ -1,7 +1,6 @@
 package main
 
 import (
-	"crypto/subtle"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -26,6 +25,7 @@ type HubCoordinator struct {
 	localSniff *agent.RealSniffer
 	syncEngine *hub.SyncEngine
 	nodeMgr    *hub.NodeManager
+	auth       *hub.AuthWatchdog
 	activeS1   string
 	activeS2   string
 	lastPing   hub.PingBurstReport
@@ -39,8 +39,8 @@ func main() {
 	port := flag.String("port", "8443", "Secure web panel port")
 	secretPath := flag.String("secret", "sahand-default", "Persistent secret URL path")
 	token := flag.String("token", "", "Shared agent authentication token")
-	authUser := flag.String("auth-user", "", "Optional HTTP Basic Auth username (blank = disabled)")
-	authPass := flag.String("auth-pass", "", "Optional HTTP Basic Auth password (blank = disabled)")
+	authUser := flag.String("auth-user", "", "Optional Web Login username (blank = disabled)")
+	authPass := flag.String("auth-pass", "", "Optional Web Login password (blank = disabled)")
 	flag.Parse()
 
 	if *daemonMode {
@@ -74,31 +74,42 @@ func runDaemonServer(port, secret, token, authUser, authPass string) {
 		httpClient: &http.Client{Timeout: 2500 * time.Millisecond},
 	}
 
-	// Background poller for Server 2 (CP4-CP6) so UI never blocks or flashes empty on border lag
-	go hc.pollRemoteLoop()
+	hc.auth = hub.NewAuthWatchdog(
+		authUser,
+		authPass,
+		func(reason string) {
+			log.Printf("[sahand-hub] Auto-stopping capture (%s)", reason)
+			hc.localSniff.Stop()
+			hc.forwardRemoteQuery("action=stop")
+		},
+		func() {
+			hc.nodeMgr.WipeSensitiveMemory()
+		},
+	)
 
-	guard := func(next http.HandlerFunc) http.HandlerFunc {
-		return func(w http.ResponseWriter, r *http.Request) {
-			if authUser != "" && authPass != "" {
-				u, p, ok := r.BasicAuth()
-				uOk := subtle.ConstantTimeCompare([]byte(u), []byte(authUser)) == 1
-				pOk := subtle.ConstantTimeCompare([]byte(p), []byte(authPass)) == 1
-				if !ok || !uOk || !pOk {
-					w.Header().Set("WWW-Authenticate", `Basic realm="Sahand Matrix Hub"`)
-					http.Error(w, "Unauthorized", http.StatusUnauthorized)
-					return
-				}
-			}
-			next(w, r)
-		}
-	}
+	go hc.pollRemoteLoop()
 
 	baseRoute := fmt.Sprintf("/matrix/%s", strings.Trim(secret, "/"))
 	mux := http.NewServeMux()
 
-	mux.HandleFunc(baseRoute+"/api/control", guard(func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc(baseRoute+"/login", func(w http.ResponseWriter, r *http.Request) {
+		hc.auth.HandleLogin(w, r, baseRoute)
+	})
+
+	mux.HandleFunc(baseRoute+"/logout", func(w http.ResponseWriter, r *http.Request) {
+		hc.auth.HandleLogout(w, r, baseRoute)
+	})
+
+	mux.HandleFunc(baseRoute+"/api/update", hc.auth.GuardAPI(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"status": "updating"})
+		hub.TriggerSelfUpdate()
+	}))
+
+	mux.HandleFunc(baseRoute+"/api/control", hc.auth.GuardAPI(func(w http.ResponseWriter, r *http.Request) {
 		action := r.URL.Query().Get("action")
 		if action == "start" {
+			hc.auth.ArmLoginTimers()
 			hc.localSniff.Start()
 		} else {
 			hc.localSniff.Stop()
@@ -108,7 +119,7 @@ func runDaemonServer(port, secret, token, authUser, authPass string) {
 		_ = json.NewEncoder(w).Encode(map[string]any{"capturing": hc.localSniff.IsRunning()})
 	}))
 
-	mux.HandleFunc(baseRoute+"/api/ports", guard(func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc(baseRoute+"/api/ports", hc.auth.GuardAPI(func(w http.ResponseWriter, r *http.Request) {
 		portsCSV := r.URL.Query().Get("ports")
 		locked := hc.localSniff.SetPortFilterCSV(portsCSV)
 		hc.mu.Lock()
@@ -119,7 +130,7 @@ func runDaemonServer(port, secret, token, authUser, authPass string) {
 		_ = json.NewEncoder(w).Encode(map[string]any{"locked_ports": locked})
 	}))
 
-	mux.HandleFunc(baseRoute+"/api/pair", guard(func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc(baseRoute+"/api/pair", hc.auth.GuardAPI(func(w http.ResponseWriter, r *http.Request) {
 		hc.mu.Lock()
 		if s1 := r.URL.Query().Get("s1"); s1 != "" {
 			hc.activeS1 = s1
@@ -134,7 +145,7 @@ func runDaemonServer(port, secret, token, authUser, authPass string) {
 		w.WriteHeader(http.StatusOK)
 	}))
 
-	mux.HandleFunc(baseRoute+"/api/nodes/add", guard(func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc(baseRoute+"/api/nodes/add", hc.auth.GuardAPI(func(w http.ResponseWriter, r *http.Request) {
 		var req struct {
 			Name     string `json:"name"`
 			Role     string `json:"role"`
@@ -160,7 +171,7 @@ func runDaemonServer(port, secret, token, authUser, authPass string) {
 		_ = json.NewEncoder(w).Encode(node)
 	}))
 
-	mux.HandleFunc(baseRoute+"/api/nodes/delete", guard(func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc(baseRoute+"/api/nodes/delete", hc.auth.GuardAPI(func(w http.ResponseWriter, r *http.Request) {
 		id := r.URL.Query().Get("id")
 		hc.nodeMgr.DeleteNode(id)
 		hc.mu.Lock()
@@ -169,16 +180,16 @@ func runDaemonServer(port, secret, token, authUser, authPass string) {
 		}
 		hc.mu.Unlock()
 		w.WriteHeader(http.StatusOK)
-	})) // <-- ensure this closing brace and parenthesis are followed by a comma if needed, or closed properly
+	}))
 
-	mux.HandleFunc(baseRoute+"/api/nodes/deploy", guard(func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc(baseRoute+"/api/nodes/deploy", hc.auth.GuardAPI(func(w http.ResponseWriter, r *http.Request) {
 		id := r.URL.Query().Get("id")
 		hubHost := strings.Split(r.Host, ":")[0]
 		hc.nodeMgr.DeployAgentAsync(id, hubHost, hc.token)
 		w.WriteHeader(http.StatusOK)
 	}))
 
-	mux.HandleFunc(baseRoute+"/api/pause-burst", guard(func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc(baseRoute+"/api/pause-burst", hc.auth.GuardAPI(func(w http.ResponseWriter, r *http.Request) {
 		targetHost := hc.getS2HostPort()
 		report := hc.syncEngine.GetOrMeasure5Pings(targetHost, hc.token, false)
 		hc.mu.Lock()
@@ -187,11 +198,11 @@ func runDaemonServer(port, secret, token, authUser, authPass string) {
 		hc.writeMergedState(w)
 	}))
 
-	mux.HandleFunc(baseRoute+"/api/state", guard(func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc(baseRoute+"/api/state", hc.auth.GuardAPI(func(w http.ResponseWriter, r *http.Request) {
 		hc.writeMergedState(w)
 	}))
 
-	mux.HandleFunc(baseRoute+"/", guard(func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc(baseRoute+"/", hc.auth.GuardUI(baseRoute, func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		_, _ = w.Write([]byte(hub.DashboardHTML))
 	}))
@@ -232,7 +243,6 @@ func (hc *HubCoordinator) pollRemoteLoop() {
 		s2 := hc.activeS2
 		hc.mu.RUnlock()
 
-		// Auto-select first remote node if activeS2 is still local-s1
 		if s2 == "local-s1" {
 			for _, n := range hc.nodeMgr.ListNodes() {
 				if n.ID != "local-s1" {
@@ -279,6 +289,7 @@ func (hc *HubCoordinator) writeMergedState(w http.ResponseWriter) {
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]any{
 		"capturing":    hc.localSniff.IsRunning(),
+		"auto_stop_s":  hc.auth.RemainingSeconds(),
 		"locked_ports": hc.localSniff.GetLockedPorts(),
 		"checkpoints":  merged,
 		"guides":       analyzer.AllCheckpointGuides(),
