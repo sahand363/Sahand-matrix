@@ -48,7 +48,7 @@ var DashboardHTML = `<!DOCTYPE html>
   .tool-group { display: flex; align-items: center; gap: 7px; flex-wrap: wrap; }
 
   .cp-row {
-    display: flex; gap: 0; align-items: stretch;
+    display: flex; gap: 0; align-items: flex-start;
     background: var(--card); border: 1px solid var(--border); border-left: 4px solid var(--emerald);
     border-radius: 10px; padding: 11px 14px; margin-bottom: 10px;
   }
@@ -56,13 +56,13 @@ var DashboardHTML = `<!DOCTYPE html>
   .cp-row.warning { border-left-color: var(--amber); }
   .cp-left { width: var(--left-col); min-width: 30%; max-width: 85%; display: flex; flex-direction: column; gap: 6px; flex-shrink: 0; }
   .splitter {
-    width: 10px; cursor: col-resize; display: flex; align-items: center; justify-content: center;
-    margin: 0 4px; border-radius: 4px; background: rgba(255,255,255,0.03); color: #64748B; font-size: 10px; user-select: none;
+    width: 10px; align-self: stretch; cursor: col-resize; display: flex; align-items: center; justify-content: center;
+    margin: 0 5px; border-radius: 4px; background: rgba(255,255,255,0.03); color: #64748B; font-size: 11px; user-select: none;
   }
   .splitter:hover { background: rgba(56,189,248,0.25); color: #FFF; }
   .cp-right {
     flex: 1; min-width: 180px; background: #0A0E19; border: 1px solid #1E293B; border-radius: 8px;
-    padding: 9px 12px; display: flex; flex-direction: column; justify-content: space-between; font-size: 11.5px; line-height: 1.42;
+    padding: 9px 12px; display: flex; flex-direction: column; justify-content: flex-start; gap: 6px; font-size: 11.5px; line-height: 1.42;
   }
   .cp-top { display: flex; justify-content: space-between; align-items: center; gap: 8px; flex-wrap: wrap; }
   .cp-title { font-size: 13px; font-weight: 700; color: var(--cyan); }
@@ -106,7 +106,7 @@ var DashboardHTML = `<!DOCTYPE html>
     background: #0F172A; border: 1px solid #1E293B; border-radius: 5px; padding: 5px 8px;
     margin-bottom: 5px; font-family: monospace; font-size: 11px; display: flex; justify-content: space-between; flex-wrap: wrap; gap: 4px; direction: ltr;
   }
-  .verdict { margin-top: 4px; padding: 5px 8px; border-radius: 5px; background: rgba(56,189,248,0.12); color: #7DD3FC; font-weight: 600; border-left: 3px solid var(--cyan); }
+  .verdict { margin-top: 2px; padding: 5px 8px; border-radius: 5px; background: rgba(56,189,248,0.12); color: #7DD3FC; font-weight: 600; border-left: 3px solid var(--cyan); }
   .verdict.crit { background: rgba(239,68,68,0.18); color: #FECACA; border-left-color: var(--crimson); }
   .verdict.warn { background: rgba(245,158,11,0.16); color: #FDE68A; border-left-color: var(--amber); }
 
@@ -142,13 +142,13 @@ var DashboardHTML = `<!DOCTYPE html>
 <div class="wrap">
   <div id="viewMatrix">
     <div class="toolbar">
-      <div id="pingBanner"><strong>Drag ⇔ bar</strong> between columns to widen packet lines, or scroll horizontally inside any box</div>
+      <div id="pingBanner"><strong>Drag ⋮ bar</strong> between columns to widen packet lines, or scroll horizontally inside any box</div>
       <div class="tool-group">
         <input id="portFilter" class="ltr" placeholder="Ports (e.g. 443, 8443)" oninput="applyFilters()" style="width:170px;">
         <button id="btnLockP" class="btn btn-pause" onclick="lockSnifferPorts()">🔒 Lock Ports</button>
         <button id="btnAllP" class="btn" onclick="unlockSnifferPorts()">🔓 All</button>
         <span id="lockPortBadge" class="ltr" style="font-size:11px;color:var(--emerald);font-weight:700;">[All Ports]</span>
-        <button class="btn" onclick="resetCumulativeStats()" title="Reset cumulative session stealth counters">↺ Reset Stats</button>
+        <button class="btn" onclick="resetCumulativeStats()" title="Reset cumulative session stealth counters in browser memory">↺ Reset Stats</button>
         <button class="btn" onclick="toggleWrapLines()" id="wrapBtn">↩ Wrap Lines</button>
         <label style="cursor:pointer;display:flex;align-items:center;gap:4px;color:#FCA5A5;font-weight:600;">
           <input type="checkbox" id="leaksOnly" onchange="applyFilters()"> <span id="lblRedOnly">🔴 Red</span>
@@ -187,7 +187,6 @@ var DashboardHTML = `<!DOCTYPE html>
 <script>
 let isPaused = false, selectedTag = '', lastData = null, lastNodeKey = '', domInitialized = false, lang = 'en', isDraggingSplit = false;
 const scrollLocks = {};
-// Cumulative Session Tracker per Checkpoint so Stealth % stays rock-solid over time
 const cumStats = {};
 function initCum(id) {
   if (!cumStats[id]) cumStats[id] = { maxSeq: 0, wSum: 0, bytes: 0, safe: 0, warn: 0, crit: 0, ema: -1 };
@@ -199,7 +198,6 @@ function resetCumulativeStats() {
 }
 function toggleWrapLines() { document.body.classList.toggle('wrap-lines'); }
 
-// Horizontal Drag Splitter Logic (drag right side of any packet window left/right)
 document.addEventListener('mousemove', e => {
   if (!isDraggingSplit) return;
   const wrap = document.querySelector('.wrap').getBoundingClientRect();
@@ -343,7 +341,6 @@ function renderMatrix(d) {
     const allEvs = (d.checkpoints && d.checkpoints[g.id]) || [];
     const cs = initCum(g.id);
 
-    // Feed new unique packets into cumulative session tracker
     let winWSum = 0, winBytes = 0;
     allEvs.forEach(e => {
       const b = Math.max(1, e.length || 1);
@@ -385,7 +382,7 @@ function renderMatrix(d) {
     const dPort = last ? splitPort(last.dst_addr)[1] : '—';
 
     document.getElementById('row-' + g.id).className = 'cp-row ' + (isCrit ? 'critical' : (isWarn ? 'warning' : ''));
-    document.getElementById('title-' + g.id).innerHTML = (fg ? fg.t : g.title) + ' <bdi>(' + evs.length + ' win | ' + totalMB + ' total)</bdi>';
+    document.getElementById('title-' + g.id).innerHTML = (fg ? fg.t : g.title) + ' <bdi>(' + evs.length + ' in buf | ' + totalMB + ' analyzed)</bdi>';
     document.getElementById('zone-' + g.id).innerHTML = fg ? fg.z : g.dpi_zone;
     document.getElementById('srv-' + g.id).innerText = getServerLabel(d, g.server_role);
 
