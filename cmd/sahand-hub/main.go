@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"log"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"sahand-matrix/internal/agent"
