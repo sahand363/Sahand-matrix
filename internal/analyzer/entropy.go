@@ -56,8 +56,8 @@ func EvaluateDPIRisk(cp models.CheckpointID, payload []byte, tls models.TLSMetad
 				Explanation:    fmt.Sprintf("CRITICAL LEAK: Cleartext SNI '%s' is visible to deep packet inspection!", tls.SNI),
 			}
 		}
-		score := 95
-		if h >= 6.8 && h <= 7.95 {
+		score := 96
+		if h >= 6.8 && h <= 7.98 {
 			score = 98
 		}
 		return models.DPIAssessment{
@@ -70,43 +70,43 @@ func EvaluateDPIRisk(cp models.CheckpointID, payload []byte, tls models.TLSMetad
 		}
 	}
 
-	// 2. Tiny TCP Multiplexer Keep-Alives / Control Ticks (<= 16 bytes)
-	if size <= 16 {
+	// 2. Tiny TCP Multiplexer Keep-Alives / Control Ticks (<= 24 bytes)
+	if size <= 24 {
 		return models.DPIAssessment{
 			ShannonEntropy: h,
-			StealthScore:   75,
-			RiskScore:      20,
+			StealthScore:   82,
+			RiskScore:      15,
 			Level:          models.RiskWarning,
-			ColorMeaning:   "🟡 YELLOW LINE = Tiny Tunnel Keep-Alive / Control Frame (<=16B)",
+			ColorMeaning:   "🟡 YELLOW LINE = Tiny Tunnel Keep-Alive / Control Frame (<=24B)",
 			Explanation:    fmt.Sprintf("LOW-VOLUME CONTROL (%dB, H=%.2f): Small multiplexer heartbeat or ACK tick. Normal in moderation.", size, h),
 		}
 	}
 
-	// 3. Large High-Entropy TCP Continuation Chunks (MTU fragmented TLS records without header at byte 0)
+	// 3. Large High-Entropy TCP Continuation Chunks (MTU/TSO split segments of TLS records)
 	if size >= 256 && h >= 7.05 {
 		return models.DPIAssessment{
 			ShannonEntropy: h,
-			StealthScore:   70,
-			RiskScore:      25,
-			Level:          models.RiskWarning,
-			ColorMeaning:   "🟡 YELLOW LINE = High-Entropy TCP Continuation Segment (No TLS Header at Byte 0)",
-			Explanation:    fmt.Sprintf("FRAGMENTED CIPHERTEXT (%dB, H=%.2f): TCP continuation segment of a larger TLS record or unframed stream.", size, h),
+			StealthScore:   94,
+			RiskScore:      8,
+			Level:          models.RiskOptimal,
+			ColorMeaning:   "🔵 BLUE LINE = Encrypted TLS Continuation Segment (High-Entropy Payload)",
+			Explanation:    fmt.Sprintf("SAFE TLS SEGMENT (%dB, H=%.2f): High-entropy TCP continuation payload of an active TLS session.", size, h),
 		}
 	}
 
-	// 4. Unframed High-Entropy Small/Medium Stream
+	// 4. Unframed High-Entropy Small/Medium Stream (25B - 255B without TLS header)
 	if h > 7.1 {
 		return models.DPIAssessment{
 			ShannonEntropy: h,
-			StealthScore:   18,
-			RiskScore:      80,
-			Level:          models.RiskCritical,
-			ColorMeaning:   "🔴 RED LINE = Unframed High-Entropy Stream (No \\x17\\x03\\x03 TLS Header!)",
-			Explanation:    fmt.Sprintf("EXPOSED TO DPI (Red): High entropy (%.2f/8.00) WITHOUT a TLS header! Deep packet inspection flags unframed encrypted tunnels.", h),
+			StealthScore:   35,
+			RiskScore:      65,
+			Level:          models.RiskWarning,
+			ColorMeaning:   "🟡 YELLOW LINE = Unframed High-Entropy Packet (No \\x17\\x03\\x03 Header)",
+			Explanation:    fmt.Sprintf("NOTICE (%dB, H=%.2f): Short encrypted packet without a TLS header at byte 0.", size, h),
 		}
 	}
 
-	// 5. Unencrypted Plaintext or Low-Entropy Control Headers (> 16 bytes)
+	// 5. Unencrypted Plaintext or Low-Entropy Control Headers (> 24 bytes)
 	return models.DPIAssessment{
 		ShannonEntropy: h,
 		StealthScore:   8,
@@ -134,8 +134,8 @@ func AllCheckpointGuides() []models.CheckpointGuide {
 			ID: models.CP1_IranClientIngress, ServerRole: "iran",
 			Title: "CP1: Main Server Ingress NIC (Client ➔ Main Server)", DPIZone: "🚨 ENTRY ISP DPI ZONE", DPIVisible: true,
 			WhatYouSee: "Packets arriving at your Main Server from the client device.",
-			GoodForDPI: "🔵 Blue lines: TLS 1.3 frames (\\x17\\x03\\x03) or clean SNI.",
-			BadForDPI:  "🔴 Red lines: Plaintext headers or unframed high-entropy streams.",
+			GoodForDPI: "🔵 Blue lines: TLS 1.3 frames (\\x17\\x03\\x03) or encrypted continuation segments.",
+			BadForDPI:  "🔴 Red lines: Plaintext headers or low-entropy exposed control strings.",
 		},
 		{
 			ID: models.CP2_IranTunnelCore, ServerRole: "iran",
@@ -148,7 +148,7 @@ func AllCheckpointGuides() []models.CheckpointGuide {
 			ID: models.CP3_IranBorderEgress, ServerRole: "iran",
 			Title: "CP3: Border Transit Egress (Main Server ➔ Server 2)", DPIZone: "🚨 CRITICAL: BORDER GATEWAY DPI", DPIVisible: true,
 			WhatYouSee: "Tunnel packets leaving your Main Server toward Server 2.",
-			GoodForDPI: "🔵 Blue lines: Valid TLS/WSS/Reality frames (\\x17\\x03\\x03) with high byte-weighted stealth.",
+			GoodForDPI: "🔵 Blue lines: Valid TLS/WSS/Reality frames (\\x17\\x03\\x03) with high stabilized stealth.",
 			BadForDPI:  "🔴 Red lines: Unmasked raw port-forwarding or plaintext sync strings.",
 		},
 		{
