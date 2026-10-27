@@ -1,62 +1,271 @@
 package main
 
 import (
+	"crypto/rand"
 	"crypto/subtle"
+	"encoding/hex"
 	"encoding/json"
 	"flag"
 	"fmt"
-	"log"
+	"math/big"
 	"net/http"
+	"os/exec"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"sahand-matrix/internal/agent"
 	"sahand-matrix/internal/analyzer"
 )
 
+type captchaChallenge struct {
+	answer  int
+	expires time.Time
+}
+
+type SentinelAuth struct {
+	mu        sync.Mutex
+	user      string
+	pass      string
+	sessions  map[string]time.Time
+	captchas  map[string]captchaChallenge
+	failCount map[string]int
+	lockUntil map[string]time.Time
+	stop10m   time.Time
+	stop1h    time.Time
+	didStop   bool
+	onStop    func()
+}
+
+func newSentinelAuth(u, p string, onStop func()) *SentinelAuth {
+	sa := &SentinelAuth{
+		user:      strings.TrimSpace(u),
+		pass:      strings.TrimSpace(p),
+		sessions:  make(map[string]time.Time),
+		captchas:  make(map[string]captchaChallenge),
+		failCount: make(map[string]int),
+		lockUntil: make(map[string]time.Time),
+		onStop:    onStop,
+	}
+	if sa.user == "" || sa.pass == "" {
+		sa.Arm()
+	}
+	go sa.loop()
+	return sa
+}
+
+func (sa *SentinelAuth) Arm() {
+	sa.mu.Lock()
+	defer sa.mu.Unlock()
+	now := time.Now()
+	sa.stop10m = now.Add(10 * time.Minute)
+	sa.stop1h = now.Add(60 * time.Minute)
+	sa.didStop = false
+}
+
+func (sa *SentinelAuth) RemainingSeconds() int {
+	sa.mu.Lock()
+	defer sa.mu.Unlock()
+	now := time.Now()
+	if !sa.didStop && sa.stop10m.After(now) {
+		return int(sa.stop10m.Sub(now).Seconds())
+	}
+	if sa.stop1h.After(now) {
+		return int(sa.stop1h.Sub(now).Seconds())
+	}
+	return 0
+}
+
+func (sa *SentinelAuth) loop() {
+	for {
+		time.Sleep(2 * time.Second)
+		now := time.Now()
+		var fire bool
+		sa.mu.Lock()
+		if !sa.didStop && !sa.stop10m.IsZero() && now.After(sa.stop10m) {
+			sa.didStop = true
+			fire = true
+		}
+		if !sa.stop1h.IsZero() && now.After(sa.stop1h) {
+			sa.stop1h = time.Time{}
+			fire = true
+		}
+		for t, e := range sa.sessions {
+			if now.After(e) {
+				delete(sa.sessions, t)
+			}
+		}
+		sa.mu.Unlock()
+		if fire && sa.onStop != nil {
+			sa.onStop()
+		}
+	}
+}
+
+func (sa *SentinelAuth) IsAuth(r *http.Request) bool {
+	if sa.user == "" || sa.pass == "" {
+		return true
+	}
+	c, err := r.Cookie("sahand_sentinel_session")
+	if err != nil || c.Value == "" {
+		return false
+	}
+	sa.mu.Lock()
+	defer sa.mu.Unlock()
+	exp, ok := sa.sessions[c.Value]
+	if !ok || time.Now().After(exp) {
+		delete(sa.sessions, c.Value)
+		return false
+	}
+	return true
+}
+
+func (sa *SentinelAuth) GuardUI(base string, next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if sa.IsAuth(r) {
+			next(w, r)
+			return
+		}
+		sa.serveLogin(w, r, base, "")
+	}
+}
+
+func (sa *SentinelAuth) HandleLogin(w http.ResponseWriter, r *http.Request, base string) {
+	if r.Method != http.MethodPost {
+		http.Redirect(w, r, base, http.StatusFound)
+		return
+	}
+	_ = r.ParseForm()
+	ip := strings.Split(r.RemoteAddr, ":")[0]
+
+	sa.mu.Lock()
+	if until, l := sa.lockUntil[ip]; l && time.Now().Before(until) {
+		sa.mu.Unlock()
+		sa.serveLogin(w, r, base, "Too many failed attempts. Locked for 5 minutes.")
+		return
+	}
+	cid := r.FormValue("cid")
+	ch, ok := sa.captchas[cid]
+	delete(sa.captchas, cid)
+	sa.mu.Unlock()
+
+	ans, err := strconv.Atoi(strings.TrimSpace(r.FormValue("captcha")))
+	if !ok || err != nil || time.Now().After(ch.expires) || ans != ch.answer {
+		sa.serveLogin(w, r, base, "Incorrect math answer or expired challenge.")
+		return
+	}
+
+	u := strings.TrimSpace(r.FormValue("username"))
+	p := strings.TrimSpace(r.FormValue("password"))
+	uOk := subtle.ConstantTimeCompare([]byte(u), []byte(sa.user)) == 1
+	pOk := subtle.ConstantTimeCompare([]byte(p), []byte(sa.pass)) == 1
+
+	if !uOk || !pOk {
+		sa.mu.Lock()
+		sa.failCount[ip]++
+		if sa.failCount[ip] >= 5 {
+			sa.lockUntil[ip] = time.Now().Add(5 * time.Minute)
+			sa.failCount[ip] = 0
+		}
+		sa.mu.Unlock()
+		sa.serveLogin(w, r, base, "Invalid username or password.")
+		return
+	}
+
+	tok := randomHex(20)
+	sa.mu.Lock()
+	delete(sa.failCount, ip)
+	sa.sessions[tok] = time.Now().Add(1 * time.Hour)
+	sa.mu.Unlock()
+
+	sa.Arm()
+	http.SetCookie(w, &http.Cookie{Name: "sahand_sentinel_session", Value: tok, Path: "/", HttpOnly: true, SameSite: http.SameSiteLaxMode, MaxAge: 3600})
+	http.Redirect(w, r, base, http.StatusFound)
+}
+
+func (sa *SentinelAuth) HandleLogout(w http.ResponseWriter, r *http.Request, base string) {
+	if c, err := r.Cookie("sahand_sentinel_session"); err == nil {
+		sa.mu.Lock()
+		delete(sa.sessions, c.Value)
+		sa.mu.Unlock()
+	}
+	if sa.onStop != nil {
+		sa.onStop()
+	}
+	http.SetCookie(w, &http.Cookie{Name: "sahand_sentinel_session", Value: "", Path: "/", MaxAge: -1})
+	http.Redirect(w, r, base, http.StatusFound)
+}
+
+func (sa *SentinelAuth) serveLogin(w http.ResponseWriter, _ *http.Request, base, errMsg string) {
+	a, b := randInt(4, 19), randInt(3, 15)
+	cid := randomHex(10)
+	sa.mu.Lock()
+	sa.captchas[cid] = captchaChallenge{answer: a + b, expires: time.Now().Add(3 * time.Minute)}
+	sa.mu.Unlock()
+
+	errBox := ""
+	if errMsg != "" {
+		errBox = `<div style="background:rgba(239,68,68,0.18);border:1px solid #EF4444;color:#FCA5A5;padding:8px 10px;border-radius:6px;margin-bottom:12px;font-size:12px;">⚠ ` + errMsg + `</div>`
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	_, _ = fmt.Fprintf(w, sentinelLoginTemplate, errBox, base+"/login", cid, a, b)
+}
+
 func main() {
-	role := flag.String("role", "kharej", "Node role: 'iran' (Main Server CP1-CP3) or 'kharej' (Server 2 CP4-CP6)")
-	serverID := flag.String("id", "server-2", "Unique Server Node ID")
-	peerIP := flag.String("peer", "", "Peer Server IP to classify CP3/CP4 transit traffic")
-	_ = flag.String("token", "", "Optional shared token for Hub API calls")
-	secretPath := flag.String("secret", "", "Optional persistent secret URL path for Sentinel Web UI")
-	authUser := flag.String("auth-user", "", "Optional HTTP Basic Auth username (blank = disabled)")
-	authPass := flag.String("auth-pass", "", "Optional HTTP Basic Auth password (blank = disabled)")
-	listenAddr := flag.String("listen", ":9444", "Sentinel API & 3-Window Web UI port")
+	role := flag.String("role", "kharej", "Node role")
+	serverID := flag.String("id", "server-2", "Server Node ID")
+	peerIP := flag.String("peer", "", "Peer Server IP")
+	token := flag.String("token", "", "Shared authentication token")
+	secretPath := flag.String("secret", "", "Persistent secret URL path")
+	authUser := flag.String("auth-user", "", "Optional Sentinel Login username")
+	authPass := flag.String("auth-pass", "", "Optional Sentinel Login password")
+	listenAddr := flag.String("listen", ":9444", "Sentinel API & Web UI port")
 	flag.Parse()
 
 	sniffer := agent.NewRealSniffer(*role, *serverID, *peerIP, 9444)
-
 	go func() {
-		if err := sniffer.RunCaptureLoop(); err != nil {
-			log.Printf("[sahand-sentinel] Raw socket warning: %v", err)
-		}
+		_ = sniffer.RunCaptureLoop()
 	}()
+
+	auth := newSentinelAuth(*authUser, *authPass, func() {
+		sniffer.Stop()
+	})
 
 	cors := func(next http.HandlerFunc) http.HandlerFunc {
 		return func(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Access-Control-Allow-Origin", "*")
-			next(w, r)
-		}
-	}
-
-	uiGuard := func(next http.HandlerFunc) http.HandlerFunc {
-		return func(w http.ResponseWriter, r *http.Request) {
-			if *authUser != "" && *authPass != "" {
-				u, p, ok := r.BasicAuth()
-				uMatch := subtle.ConstantTimeCompare([]byte(u), []byte(*authUser)) == 1
-				pMatch := subtle.ConstantTimeCompare([]byte(p), []byte(*authPass)) == 1
-				if !ok || !uMatch || !pMatch {
-					w.Header().Set("WWW-Authenticate", `Basic realm="Sahand Sentinel 3-Window Lab"`)
-					http.Error(w, "Authentication required", http.StatusUnauthorized)
-					return
-				}
+			if *token != "" && r.URL.Query().Get("token") != *token && r.Header.Get("X-Sahand-Token") != *token {
+				// Allow UI cookies or valid token
 			}
 			next(w, r)
 		}
 	}
 
-	http.HandleFunc("/api/ping", cors(func(w http.ResponseWriter, r *http.Request) {
+	uiPath := "/"
+	if s := strings.Trim(*secretPath, "/"); s != "" {
+		uiPath = "/sentinel/" + s + "/"
+	}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc(uiPath+"login", func(w http.ResponseWriter, r *http.Request) {
+		auth.HandleLogin(w, r, uiPath)
+	})
+	mux.HandleFunc(uiPath+"logout", func(w http.ResponseWriter, r *http.Request) {
+		auth.HandleLogout(w, r, uiPath)
+	})
+
+	mux.HandleFunc(uiPath+"api/update", cors(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"status": "updating"})
+		go func() {
+			time.Sleep(300 * time.Millisecond)
+			cmd := `export PATH=$PATH:/usr/local/go/bin; TMP=/tmp/agent-upd-$$; git clone --depth 1 https://github.com/sahand363/Sahand-matrix.git $TMP && cd $TMP && go mod tidy && CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o /usr/local/bin/sahand-agent ./cmd/sahand-agent && rm -rf $TMP && systemctl restart sahand-agent`
+			_ = exec.Command("bash", "-c", cmd).Run()
+		}()
+	}))
+
+	mux.HandleFunc(uiPath+"api/ping", cors(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"server_id":      *serverID,
@@ -66,7 +275,7 @@ func main() {
 		})
 	}))
 
-	http.HandleFunc("/api/control", cors(func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc(uiPath+"api/control", cors(func(w http.ResponseWriter, r *http.Request) {
 		action := r.URL.Query().Get("action")
 		if peer := r.URL.Query().Get("peer"); peer != "" {
 			sniffer.SetPeerIP(peer)
@@ -75,6 +284,7 @@ func main() {
 			sniffer.SetPortFilterCSV(r.URL.Query().Get("ports"))
 		}
 		if action == "start" {
+			auth.Arm()
 			sniffer.Start()
 		} else if action == "stop" {
 			sniffer.Stop()
@@ -82,35 +292,76 @@ func main() {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"capturing":    sniffer.IsRunning(),
+			"auto_stop_s":  auth.RemainingSeconds(),
 			"role":         *role,
 			"locked_ports": sniffer.GetLockedPorts(),
 		})
 	}))
 
-	http.HandleFunc("/api/snapshot", cors(func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc(uiPath+"api/snapshot", cors(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"server_id":    *serverID,
 			"role":         *role,
 			"capturing":    sniffer.IsRunning(),
+			"auto_stop_s":  auth.RemainingSeconds(),
 			"locked_ports": sniffer.GetLockedPorts(),
 			"checkpoints":  sniffer.GetSnapshot(),
 			"guides":       analyzer.AllCheckpointGuides(),
 		})
 	}))
 
-	serveUI := uiGuard(func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc(uiPath, auth.GuardUI(uiPath, func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		_, _ = fmt.Fprint(w, agentSentinelHTML)
-	})
-	http.HandleFunc("/", serveUI)
-	if s := strings.Trim(*secretPath, "/"); s != "" {
-		http.HandleFunc("/sentinel/"+s+"/", serveUI)
-	}
+	}))
 
-	log.Printf("[sahand-sentinel] (%s) active on %s", *role, *listenAddr)
-	log.Fatal(http.ListenAndServe(*listenAddr, nil))
+	log.Printf("[sahand-sentinel] (%s) active on %s%s", *role, *listenAddr, uiPath)
+	log.Fatal(http.ListenAndServe(*listenAddr, mux))
 }
+
+func randomHex(n int) string {
+	b := make([]byte, n)
+	_, _ = rand.Read(b)
+	return hex.EncodeToString(b)
+}
+
+func randInt(min, max int) int {
+	n, _ := rand.Int(rand.Reader, big.NewInt(int64(max-min+1)))
+	return int(n.Int64()) + min
+}
+
+const sentinelLoginTemplate = `<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8"><title>SAHAND SENTINEL // Security Gate</title>
+<style>
+  body { background:#0B0F19; color:#F8FAFC; font-family:'Inter',system-ui,sans-serif; display:flex; align-items:center; justify-content:center; min-height:100vh; margin:0; }
+  .card { background:#111827; border:1px solid #1E293B; border-top:3px solid #38BDF8; border-radius:12px; padding:26px 28px; width:100%%; max-width:380px; box-shadow:0 20px 40px rgba(0,0,0,0.5); }
+  h2 { font-size:16px; color:#38BDF8; margin:0 0 6px 0; display:flex; align-items:center; gap:8px; }
+  p { font-size:12px; color:#94A3B8; margin:0 0 18px 0; }
+  label { display:block; font-size:12px; color:#CBD5E1; margin-bottom:5px; font-weight:600; }
+  input { width:100%%; box-sizing:border-box; background:#070B14; border:1px solid #1E293B; color:#FFF; padding:9px 12px; border-radius:6px; font-size:13px; margin-bottom:14px; }
+  input:focus { outline:none; border-color:#38BDF8; }
+  .math-box { background:#0D1322; border:1px solid #38BDF8; border-radius:8px; padding:10px 12px; margin-bottom:16px; display:flex; align-items:center; justify-content:space-between; }
+  .btn { width:100%%; background:#10B981; color:#04130D; border:none; padding:10px; border-radius:6px; font-size:13px; font-weight:700; cursor:pointer; }
+  .btn:hover { filter:brightness(1.1); }
+</style></head><body>
+<div class="card">
+  <h2>❖ SAHAND SENTINEL</h2>
+  <p>Protected Node Diagnostic Lab (1h Session / 10m Auto-Stop)</p>
+  %s
+  <form method="POST" action="%s">
+    <input type="hidden" name="cid" value="%s">
+    <label>Username</label>
+    <input type="text" name="username" required autofocus placeholder="Enter username">
+    <label>Password</label>
+    <input type="password" name="password" required placeholder="••••••••">
+    <div class="math-box">
+      <span style="font-size:13px;font-weight:700;color:#7DD3FC;">Security Check: %d + %d = ?</span>
+      <input type="number" name="captcha" required placeholder="?" style="width:85px;margin:0;text-align:center;font-weight:700;">
+    </div>
+    <button class="btn" type="submit">🔓 Unlock Sentinel Node</button>
+  </form>
+</div></body></html>`
 
 const agentSentinelHTML = `<!DOCTYPE html>
 <html lang="en">
@@ -124,7 +375,7 @@ const agentSentinelHTML = `<!DOCTYPE html>
   header { background:#0D1322; border-bottom:1px solid var(--border); padding:10px 18px; display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:10px; position:sticky; top:0; z-index:30; }
   .wrap { max-width:1860px; margin:0 auto; padding:12px 16px; }
   .toolbar { display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:10px; margin-bottom:10px; font-size:12px; background:#111827; padding:8px 14px; border-radius:8px; border:1px solid var(--border); }
-  .btn { padding:6px 10px; border-radius:6px; border:1px solid var(--border); background:var(--card); color:var(--text); cursor:pointer; font-size:12px; font-weight:600; }
+  .btn { padding:6px 10px; border-radius:6px; border:1px solid var(--border); background:var(--card); color:var(--text); cursor:pointer; font-size:12px; font-weight:600; text-decoration:none; }
   .btn:hover { filter:brightness(1.15); }
   .btn-start { border-color:var(--emerald); color:var(--emerald); background:rgba(16,185,129,0.12); }
   .btn-stop { border-color:var(--crimson); color:var(--crimson); background:rgba(239,68,68,0.12); }
@@ -165,24 +416,29 @@ const agentSentinelHTML = `<!DOCTYPE html>
   .verdict.warn { background:rgba(245,158,11,0.16); color:#FDE68A; border-left-color:var(--amber); }
 </style></head><body>
 <header>
-  <div><strong id="hdr" style="color:var(--cyan);font-size:15px;">❖ SAHAND SENTINEL // 3-WINDOW NODE</strong></div>
-  <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
+  <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;">
+    <strong id="hdr" style="color:var(--cyan);font-size:15px;">❖ SAHAND SENTINEL</strong>
+    <button class="btn btn-pause" onclick="updAgent()" id="updBtn" title="Rebuild & restart sentinel agent">🚀 Update</button>
+  </div>
+  <div style="display:flex;gap:7px;align-items:center;flex-wrap:wrap;">
+    <span id="timerPill" class="pill" style="border-color:var(--cyan);color:var(--cyan);">⏱ 10:00</span>
     <span id="statePill" class="pill">● STOPPED</span>
-    <button class="btn btn-start" onclick="ctrl('start')">▶ Start Capture</button>
-    <button class="btn btn-stop" onclick="ctrl('stop')">■ Stop Capture</button>
+    <button class="btn btn-start" onclick="ctrl('start')">▶ Start</button>
+    <button class="btn btn-stop" onclick="ctrl('stop')">■ Stop</button>
     <button class="btn" onclick="toggleLang()">🌐 فارسی / EN</button>
+    <a href="logout" class="btn btn-stop" title="Wipe session & lock">🔒 Logout</a>
   </div>
 </header>
 <div class="wrap">
   <div class="toolbar">
     <div><strong>Entropy Guide:</strong> <span class="ent-tag ent-ok">🟢 6.5–7.98 + TLS = Safe HTTPS</span> <span class="ent-tag ent-crit">🔴 >7.1 No TLS = Raw Cipher Risk</span></div>
     <div style="display:flex;gap:7px;align-items:center;flex-wrap:wrap;">
-      <input id="pInp" class="ltr" placeholder="Ports (e.g. 443, 8443)" style="width:165px">
-      <button class="btn" onclick="lockP()">🔒 Lock Ports</button>
+      <input id="pInp" class="ltr" placeholder="Ports (e.g. 443, 8443)" style="width:160px">
+      <button class="btn" onclick="lockP()">🔒 Lock</button>
       <button class="btn" onclick="unlockP()">🔓 All</button>
       <span id="lockBadge" class="ltr" style="font-size:11px;color:var(--emerald);font-weight:700;">[All Ports]</span>
-      <button class="btn" onclick="resetCum()">↺ Reset Stats</button>
-      <button class="btn" onclick="document.body.classList.toggle('wrap-lines')">↩ Wrap Lines</button>
+      <button class="btn" onclick="resetCum()">↺ Reset</button>
+      <button class="btn" onclick="document.body.classList.toggle('wrap-lines')">↩ Wrap</button>
       <button class="btn" onclick="setH(135)">Compact</button>
       <button class="btn" onclick="setH(260)">Tall</button>
       <button class="btn" onclick="setH(440)">Max</button>
@@ -191,8 +447,31 @@ const agentSentinelHTML = `<!DOCTYPE html>
   <div id="list"></div>
 </div>
 <script>
-let lang = 'en', init = false, drag = false;
+let lang = 'en', init = false, drag = false, isDraggingSplit = false;
 const locks = {}, cum = {};
+function copyLine(ev) {
+  ev.stopPropagation();
+  const b = ev.currentTarget || ev.target;
+  const raw = b.parentElement.innerText.replace('📋 Copy', '').replace('✓ Copied', '').trim();
+  const done = () => { b.innerText = '✓ Copied'; setTimeout(() => { b.innerText = '📋 Copy'; }, 1200); };
+  if (navigator.clipboard && window.isSecureContext) {
+    navigator.clipboard.writeText(raw).then(done).catch(() => fbCopy(raw, done));
+  } else { fbCopy(raw, done); }
+}
+function fbCopy(text, cb) {
+  const ta = document.createElement('textarea'); ta.value = text;
+  ta.style.position = 'fixed'; ta.style.left = '-9999px';
+  document.body.appendChild(ta); ta.focus(); ta.select();
+  try { document.execCommand('copy'); cb(); } catch(e){}
+  document.body.removeChild(ta);
+}
+async function updAgent() {
+  const b = document.getElementById('updBtn');
+  if(!confirm('Rebuild and restart Sentinel agent?')) return;
+  b.innerText = '⏳ Updating...';
+  try { await fetch('api/update', {method:'POST'}); } catch(e){}
+  setTimeout(() => { window.location.reload(); }, 10000);
+}
 function entBadge(last, cpId) {
   if (!last) return '—';
   const h = last.dpi.shannon_entropy.toFixed(2) + '/8';
@@ -213,20 +492,25 @@ document.addEventListener('mouseup', () => { drag = false; });
 function setH(px) { document.querySelectorAll('.raw-box').forEach(b => { b.style.height = px + 'px'; }); }
 function resetCum() { Object.keys(cum).forEach(k => delete cum[k]); poll(); }
 function toggleLang() { lang = lang==='en'?'fa':'en'; document.body.classList.toggle('rtl', lang==='fa'); poll(); }
-function copyLine(ev) { ev.stopPropagation(); const b=ev.target; navigator.clipboard.writeText(b.parentElement.innerText.replace('📋 Copy','').trim()); b.innerText='✓'; setTimeout(()=>b.innerText='📋 Copy',1000); }
 function spPort(a) { if(!a) return '—'; const i=a.lastIndexOf(':'); return i>-1?a.slice(i+1):'—'; }
-async function ctrl(a) { await fetch('/api/control?action='+a); poll(); }
-async function lockP() { resetCum(); await fetch('/api/control?ports='+encodeURIComponent(document.getElementById('pInp').value)); poll(); }
-async function unlockP() { document.getElementById('pInp').value=''; resetCum(); await fetch('/api/control?ports='); poll(); }
+async function ctrl(a) { await fetch('api/control?action='+a); poll(); }
+async function lockP() { resetCum(); await fetch('api/control?ports='+encodeURIComponent(document.getElementById('pInp').value)); poll(); }
+async function unlockP() { document.getElementById('pInp').value=''; resetCum(); await fetch('api/control?ports='); poll(); }
 async function poll() {
-  const res = await fetch('/api/snapshot');
+  const res = await fetch('api/snapshot');
+  if (res.status === 401) { window.location.reload(); return; }
   const d = await res.json();
   const roleStr = (d.role || 'kharej').toLowerCase();
   const roleName = roleStr === 'iran' ? 'Main Server (S1)' : 'Server 2 (S2)';
   document.getElementById('hdr').innerHTML = '❖ SAHAND SENTINEL // <bdi>' + d.server_id + '</bdi> — ' + roleName;
   const pill = document.getElementById('statePill');
   pill.className = d.capturing ? 'pill live' : 'pill';
-  pill.innerText = d.capturing ? '● CAPTURING REAL PACKETS' : '● STOPPED';
+  pill.innerText = d.capturing ? '● CAPTURING' : '● STOPPED';
+
+  const remS = d.auto_stop_s || 0;
+  const mm = String(Math.floor(remS / 60)).padStart(2, '0'), ss = String(remS % 60).padStart(2, '0');
+  document.getElementById('timerPill').innerText = '⏱ Auto-Stop: ' + mm + ':' + ss;
+
   const lp = d.locked_ports || [];
   document.getElementById('lockBadge').innerText = lp.length ? ('[🔒 Ports: '+lp.join(',')+']') : '[All Ports]';
   let guides = (d.guides || []).filter(g => g.server_role === roleStr);
@@ -265,7 +549,7 @@ async function poll() {
     if (rem>0) lkEl.innerText = '⏸ Scroll Locked ('+rem+'s)';
     const box = document.getElementById('b-'+g.id);
     const top = box.scrollTop, left = box.scrollLeft;
-    box.innerHTML = evs.length ? evs.map(e => '<div class="raw-line '+(e.dpi.level==='CRITICAL'?'crit':(e.dpi.level==='WARNING'?'warn':''))+'"><button class="copy-btn" onclick="copyLine(event)">📋 Copy</button><span class="corr-tag">['+e.correlation_tag+']</span><span class="port-tag">Port '+spPort(e.src_addr)+'➔'+spPort(e.dst_addr)+'</span>[#'+e.sequence_num+' '+e.src_addr+'➔'+e.dst_addr+' | '+e.length+'B] '+e.raw_byte_log.replace(/</g,'&lt;')+'</div>').join('') : '<div style="color:#64748B">No matching packets. Click [▶ Start Capture]...</div>';
+    box.innerHTML = evs.length ? evs.map(e => '<div class="raw-line '+(e.dpi.level==='CRITICAL'?'crit':(e.dpi.level==='WARNING'?'warn':''))+'"><button type="button" class="copy-btn" onclick="copyLine(event)">📋 Copy</button><span class="corr-tag">['+e.correlation_tag+']</span><span class="port-tag">Port '+spPort(e.src_addr)+'➔'+spPort(e.dst_addr)+'</span>[#'+e.sequence_num+' '+e.src_addr+'➔'+e.dst_addr+' | '+e.length+'B] '+e.raw_byte_log.replace(/</g,'&lt;')+'</div>').join('') : '<div style="color:#64748B">No matching packets. Click [▶ Start]...</div>';
     if (d.capturing && rem<=0) box.scrollTop = box.scrollHeight; else box.scrollTop = top;
     box.scrollLeft = left;
     document.getElementById('ri-'+g.id).innerHTML = '<div><div class="stat-bar"><span>Proto: <strong>'+(last?last.protocol:'—')+'</strong></span><span>Ports: <strong>'+(last?spPort(last.src_addr)+' ➔ '+spPort(last.dst_addr):'—')+'</strong></span><span>Entropy: '+entBadge(last, g.id)+'</span></div><div class="avg-bar"><span><strong>Session Stealth: <bdi style="color:var(--emerald)">'+(cs.bytes?bw+'%':'—')+'</bdi></strong></span><span><bdi>🔵 '+cs.safe+' / 🟡 '+cs.warn+' / 🔴 '+cs.crit+' ('+totalMB+')</bdi></span></div><div style="color:var(--muted)"><strong>👁 What you see:</strong> '+g.what_you_see+'</div><div style="color:#6EE7B7"><strong>✓ Safe (Blue):</strong> '+g.good_for_dpi+'</div><div style="color:#FCA5A5"><strong>✗ Exposed (Red):</strong> '+g.bad_for_dpi+'</div></div><div class="verdict '+(isCrit?'crit':(isWarn?'warn':''))+'"><bdi>'+(last?(last.dpi.color_meaning+' — '+last.dpi.explanation):'Idle — Waiting for real packet stream.')+'</bdi></div>';
