@@ -77,6 +77,10 @@ var DashboardHTML = `<!DOCTYPE html>
   .dpi-badge { font-size: 10.5px; font-weight: 700; padding: 2px 8px; border-radius: 5px; }
   .dpi-badge.crit { background: rgba(239,68,68,0.2); color: #FCA5A5; border: 1px solid var(--crimson); }
   .dpi-badge.safe { background: rgba(16,185,129,0.15); color: var(--emerald); border: 1px solid var(--emerald); }
+  .ent-tag { font-size: 10px; font-weight: 700; padding: 1px 6px; border-radius: 4px; margin-left: 4px; cursor: help; }
+  .ent-ok { background: rgba(16,185,129,0.16); color: #6EE7B7; border: 1px solid var(--emerald); }
+  .ent-warn { background: rgba(245,158,11,0.16); color: #FDE68A; border: 1px solid var(--amber); }
+  .ent-crit { background: rgba(239,68,68,0.2); color: #FCA5A5; border: 1px solid var(--crimson); }
 
   .raw-box {
     background: #050811; border: 1px solid #1E293B; border-radius: 6px; padding: 7px 9px;
@@ -101,7 +105,7 @@ var DashboardHTML = `<!DOCTYPE html>
   }
   .copy-btn:hover { background: var(--cyan); color: #000; }
 
-  .stat-bar { display: flex; justify-content: space-between; flex-wrap: wrap; gap: 6px; border-bottom: 1px solid #1E293B; padding-bottom: 5px; margin-bottom: 4px; font-family: monospace; direction: ltr; }
+  .stat-bar { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 6px; border-bottom: 1px solid #1E293B; padding-bottom: 5px; margin-bottom: 4px; font-family: monospace; direction: ltr; }
   .avg-bar {
     background: #0F172A; border: 1px solid #1E293B; border-radius: 5px; padding: 5px 8px;
     margin-bottom: 5px; font-family: monospace; font-size: 11px; display: flex; justify-content: space-between; flex-wrap: wrap; gap: 4px; direction: ltr;
@@ -142,7 +146,7 @@ var DashboardHTML = `<!DOCTYPE html>
 <div class="wrap">
   <div id="viewMatrix">
     <div class="toolbar">
-      <div id="pingBanner"><strong>Drag ⋮ bar</strong> between columns to widen packet lines, or scroll horizontally inside any box</div>
+      <div id="pingBanner"><strong>Entropy Guide:</strong> <span class="ent-tag ent-ok">🟢 6.5–7.98 + TLS = Safe HTTPS</span> <span class="ent-tag ent-crit">🔴 >7.1 No TLS = Raw Cipher Risk</span></div>
       <div class="tool-group">
         <input id="portFilter" class="ltr" placeholder="Ports (e.g. 443, 8443)" oninput="applyFilters()" style="width:170px;">
         <button id="btnLockP" class="btn btn-pause" onclick="lockSnifferPorts()">🔒 Lock Ports</button>
@@ -186,25 +190,30 @@ var DashboardHTML = `<!DOCTYPE html>
 
 <script>
 let isPaused = false, selectedTag = '', lastData = null, lastNodeKey = '', domInitialized = false, lang = 'en', isDraggingSplit = false;
-const scrollLocks = {};
-const cumStats = {};
+const scrollLocks = {}, cumStats = {};
 function initCum(id) {
   if (!cumStats[id]) cumStats[id] = { maxSeq: 0, wSum: 0, bytes: 0, safe: 0, warn: 0, crit: 0, ema: -1 };
   return cumStats[id];
 }
-function resetCumulativeStats() {
-  Object.keys(cumStats).forEach(k => delete cumStats[k]);
-  if (lastData) renderMatrix(lastData);
-}
+function resetCumulativeStats() { Object.keys(cumStats).forEach(k => delete cumStats[k]); if (lastData) renderMatrix(lastData); }
 function toggleWrapLines() { document.body.classList.toggle('wrap-lines'); }
+
+function entropyBadge(last, cpId) {
+  if (!last) return '—';
+  const h = last.dpi.shannon_entropy.toFixed(2) + '/8';
+  if (cpId === 2 || cpId === 5) return '<strong>' + h + '</strong><span class="ent-tag ent-ok" title="Internal Server RAM: Invisible to external ISP DPI">' + (lang==='fa'?'🔵 رم داخلی':'🔵 Internal RAM') + '</span>';
+  if (last.dpi.level === 'OPTIMAL') return '<strong>' + h + '</strong><span class="ent-tag ent-ok" title="6.5–7.98 inside TLS framing is normal HTTPS encryption (Safe)">' + (lang==='fa'?'🟢 نرمال HTTPS':'🟢 HTTPS Norm') + '</span>';
+  if (last.length <= 24) return '<strong>' + h + '</strong><span class="ent-tag ent-warn" title="Small TCP keep-alive or control frame">' + (lang==='fa'?'🟡 بسته کنترلی':'🟡 Control Tick') + '</span>';
+  if (last.dpi.shannon_entropy > 7.1) return '<strong>' + h + '</strong><span class="ent-tag ent-crit" title="High entropy (>7.1) WITHOUT a TLS header looks like raw Shadowsocks/Cipher!">' + (lang==='fa'?'🔴 ریسک بدون TLS':'🔴 Unframed Cipher') + '</span>';
+  return '<strong>' + h + '</strong><span class="ent-tag ent-crit" title="Low entropy (<6.5) without TLS indicates readable plaintext!">' + (lang==='fa'?'🔴 متن آشکار':'🔴 Plaintext Risk') + '</span>';
+}
 
 document.addEventListener('mousemove', e => {
   if (!isDraggingSplit) return;
   const wrap = document.querySelector('.wrap').getBoundingClientRect();
   let pct = ((e.clientX - wrap.left) / wrap.width) * 100;
   if (document.body.classList.contains('rtl')) pct = ((wrap.right - e.clientX) / wrap.width) * 100;
-  pct = Math.max(32, Math.min(84, pct));
-  document.documentElement.style.setProperty('--left-col', pct.toFixed(1) + '%');
+  document.documentElement.style.setProperty('--left-col', Math.max(32, Math.min(84, pct)).toFixed(1) + '%');
 });
 document.addEventListener('mouseup', () => { isDraggingSplit = false; });
 
@@ -413,7 +422,7 @@ function renderMatrix(d) {
         '<div class="stat-bar">' +
           '<span>Proto: <strong style="color:' + protoColor + '">' + (last ? last.protocol : '—') + '</strong></span>' +
           '<span>Ports: <strong style="color:#FFF">' + sPort + ' ➔ ' + dPort + '</strong></span>' +
-          '<span>Entropy: <strong>' + (last ? last.dpi.shannon_entropy.toFixed(2) + '/8' : '—') + '</strong></span>' +
+          '<span>Entropy: ' + entropyBadge(last, g.id) + '</span>' +
         '</div>' +
         '<div class="avg-bar">' +
           '<span><strong>Session Stealth:</strong> <strong style="color:' + bwColor + ';font-size:13px;">' + (cs.bytes ? sessionStealth + '%' : '—') + '</strong> <span style="color:var(--muted)">(Live EMA: ' + (cs.bytes ? smoothEma + '%' : '—') + ')</span></span>' +
