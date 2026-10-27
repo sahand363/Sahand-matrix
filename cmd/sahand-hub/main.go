@@ -29,6 +29,7 @@ type HubCoordinator struct {
 	activeS1   string
 	activeS2   string
 	lastPing   hub.PingBurstReport
+	lastRemote map[models.CheckpointID][]models.PacketEvent
 	token      string
 	httpClient *http.Client
 }
@@ -68,9 +69,13 @@ func runDaemonServer(port, secret, token, authUser, authPass string) {
 		nodeMgr:    hub.NewNodeManager("127.0.0.1"),
 		activeS1:   "local-s1",
 		activeS2:   "local-s1",
+		lastRemote: make(map[models.CheckpointID][]models.PacketEvent),
 		token:      token,
-		httpClient: &http.Client{Timeout: 1800 * time.Millisecond},
+		httpClient: &http.Client{Timeout: 2500 * time.Millisecond},
 	}
+
+	// Background poller for Server 2 (CP4-CP6) so UI never blocks or flashes empty on border lag
+	go hc.pollRemoteLoop()
 
 	guard := func(next http.HandlerFunc) http.HandlerFunc {
 		return func(w http.ResponseWriter, r *http.Request) {
@@ -106,6 +111,9 @@ func runDaemonServer(port, secret, token, authUser, authPass string) {
 	mux.HandleFunc(baseRoute+"/api/ports", guard(func(w http.ResponseWriter, r *http.Request) {
 		portsCSV := r.URL.Query().Get("ports")
 		locked := hc.localSniff.SetPortFilterCSV(portsCSV)
+		hc.mu.Lock()
+		hc.lastRemote = make(map[models.CheckpointID][]models.PacketEvent)
+		hc.mu.Unlock()
 		hc.forwardRemoteQuery("ports=" + url.QueryEscape(portsCSV))
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]any{"locked_ports": locked})
@@ -161,7 +169,7 @@ func runDaemonServer(port, secret, token, authUser, authPass string) {
 		}
 		hc.mu.Unlock()
 		w.WriteHeader(http.StatusOK)
-	}))
+	})
 
 	mux.HandleFunc(baseRoute+"/api/nodes/deploy", guard(func(w http.ResponseWriter, r *http.Request) {
 		id := r.URL.Query().Get("id")
@@ -207,7 +215,7 @@ func (hc *HubCoordinator) forwardRemoteQuery(query string) {
 		if n.ID == "local-s1" {
 			continue
 		}
-		u := fmt.Sprintf("http://%s:%d/api/control?%s&token=%s", n.Host, n.AgentPort, query, url.QueryEscape(hc.token))
+		u := fmt.Sprintf("http://%s:%d/api/control?%s", n.Host, n.AgentPort, query)
 		go func(target string) {
 			resp, err := hc.httpClient.Get(target)
 			if err == nil {
@@ -217,28 +225,56 @@ func (hc *HubCoordinator) forwardRemoteQuery(query string) {
 	}
 }
 
+func (hc *HubCoordinator) pollRemoteLoop() {
+	for {
+		time.Sleep(850 * time.Millisecond)
+		hc.mu.RLock()
+		s2 := hc.activeS2
+		hc.mu.RUnlock()
+
+		// Auto-select first remote node if activeS2 is still local-s1
+		if s2 == "local-s1" {
+			for _, n := range hc.nodeMgr.ListNodes() {
+				if n.ID != "local-s1" {
+					s2 = n.ID
+					hc.mu.Lock()
+					hc.activeS2 = s2
+					hc.localSniff.SetPeerIP(n.Host)
+					hc.mu.Unlock()
+					break
+				}
+			}
+		}
+
+		if n, ok := hc.nodeMgr.GetNode(s2); ok && n.ID != "local-s1" {
+			u := fmt.Sprintf("http://%s:%d/api/snapshot", n.Host, n.AgentPort)
+			resp, err := hc.httpClient.Get(u)
+			if err == nil {
+				var remoteSnap struct {
+					Checkpoints map[models.CheckpointID][]models.PacketEvent `json:"checkpoints"`
+				}
+				if json.NewDecoder(resp.Body).Decode(&remoteSnap) == nil && len(remoteSnap.Checkpoints) > 0 {
+					hc.nodeMgr.MarkNodeOnline(s2)
+					hc.mu.Lock()
+					for cpID, evs := range remoteSnap.Checkpoints {
+						hc.lastRemote[cpID] = evs
+					}
+					hc.mu.Unlock()
+				}
+				_ = resp.Body.Close()
+			}
+		}
+	}
+}
+
 func (hc *HubCoordinator) writeMergedState(w http.ResponseWriter) {
 	merged := hc.localSniff.GetSnapshot()
 	hc.mu.RLock()
 	s1, s2, ping := hc.activeS1, hc.activeS2, hc.lastPing
-	hc.mu.RUnlock()
-
-	if n, ok := hc.nodeMgr.GetNode(s2); ok && n.ID != "local-s1" {
-		u := fmt.Sprintf("http://%s:%d/api/snapshot?token=%s", n.Host, n.AgentPort, url.QueryEscape(hc.token))
-		resp, err := hc.httpClient.Get(u)
-		if err == nil {
-			var remoteSnap struct {
-				Checkpoints map[models.CheckpointID][]models.PacketEvent `json:"checkpoints"`
-			}
-			if json.NewDecoder(resp.Body).Decode(&remoteSnap) == nil {
-				hc.nodeMgr.MarkNodeOnline(s2)
-				for cpID, evs := range remoteSnap.Checkpoints {
-					merged[cpID] = evs
-				}
-			}
-			_ = resp.Body.Close()
-		}
+	for cpID, evs := range hc.lastRemote {
+		merged[cpID] = evs
 	}
+	hc.mu.RUnlock()
 
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]any{
