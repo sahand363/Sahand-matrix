@@ -193,7 +193,7 @@ func (s *RealSniffer) recordPacket(cp models.CheckpointID, srcIP, dstIP string, 
 		DstAddr:        fmt.Sprintf("%s:%d", dstIP, dstPort),
 		Length:         uint32(len(payload)),
 		Protocol:       proto,
-		RawByteLog:     analyzer.FormatPythonByteLog(payload, 56),
+		RawByteLog:     analyzer.FormatPythonByteLog(payload, 160),
 		TLS:            tlsMeta,
 		DPI:            dpi,
 	}
