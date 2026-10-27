@@ -14,6 +14,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"log"
 
 	"sahand-matrix/internal/agent"
 	"sahand-matrix/internal/analyzer"
