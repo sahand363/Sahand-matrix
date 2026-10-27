@@ -10,6 +10,7 @@ var DashboardHTML = `<!DOCTYPE html>
     --bg: #0B0F19; --card: #111827; --border: #1E293B;
     --cyan: #38BDF8; --emerald: #10B981; --amber: #F59E0B;
     --crimson: #EF4444; --text: #F8FAFC; --muted: #94A3B8;
+    --left-col: 60%;
   }
   * { box-sizing: border-box; margin: 0; padding: 0; font-family: 'Inter', system-ui, Tahoma, monospace; }
   body { background: var(--bg); color: var(--text); min-height: 100vh; }
@@ -27,7 +28,7 @@ var DashboardHTML = `<!DOCTYPE html>
     padding: 6px 10px; border-radius: 6px; font-size: 12px;
   }
   .btn {
-    padding: 6px 11px; border-radius: 6px; font-size: 12px; font-weight: 600; cursor: pointer;
+    padding: 6px 10px; border-radius: 6px; font-size: 12px; font-weight: 600; cursor: pointer;
     border: 1px solid var(--border); background: var(--card); color: var(--text);
   }
   .btn:hover { filter: brightness(1.15); }
@@ -37,23 +38,32 @@ var DashboardHTML = `<!DOCTYPE html>
   .btn-tab.active { background: var(--cyan); color: #000; border-color: var(--cyan); }
   .pill { font-size: 11px; font-weight: 700; padding: 5px 10px; border-radius: 14px; border: 1px solid var(--amber); color: var(--amber); }
   .pill.live { border-color: var(--emerald); color: var(--emerald); background: rgba(16,185,129,0.1); }
-  .wrap { max-width: 1720px; margin: 0 auto; padding: 12px 18px; }
+  .wrap { max-width: 1860px; margin: 0 auto; padding: 12px 16px; }
 
   .toolbar {
     display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 10px;
     margin-bottom: 10px; font-size: 12px; background: #111827; padding: 8px 14px;
     border-radius: 8px; border: 1px solid var(--border);
   }
-  .tool-group { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .tool-group { display: flex; align-items: center; gap: 7px; flex-wrap: wrap; }
 
   .cp-row {
-    display: grid; grid-template-columns: 1.45fr 1fr; gap: 14px;
+    display: flex; gap: 0; align-items: stretch;
     background: var(--card); border: 1px solid var(--border); border-left: 4px solid var(--emerald);
-    border-radius: 10px; padding: 11px 14px; margin-bottom: 10px; align-items: stretch;
+    border-radius: 10px; padding: 11px 14px; margin-bottom: 10px;
   }
   .cp-row.critical { border-color: var(--crimson); border-left-width: 5px; background: rgba(239,68,68,0.04); }
   .cp-row.warning { border-left-color: var(--amber); }
-  .cp-left { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+  .cp-left { width: var(--left-col); min-width: 30%; max-width: 85%; display: flex; flex-direction: column; gap: 6px; flex-shrink: 0; }
+  .splitter {
+    width: 10px; cursor: col-resize; display: flex; align-items: center; justify-content: center;
+    margin: 0 4px; border-radius: 4px; background: rgba(255,255,255,0.03); color: #64748B; font-size: 10px; user-select: none;
+  }
+  .splitter:hover { background: rgba(56,189,248,0.25); color: #FFF; }
+  .cp-right {
+    flex: 1; min-width: 180px; background: #0A0E19; border: 1px solid #1E293B; border-radius: 8px;
+    padding: 9px 12px; display: flex; flex-direction: column; justify-content: space-between; font-size: 11.5px; line-height: 1.42;
+  }
   .cp-top { display: flex; justify-content: space-between; align-items: center; gap: 8px; flex-wrap: wrap; }
   .cp-title { font-size: 13px; font-weight: 700; color: var(--cyan); }
   .srv-badge {
@@ -71,13 +81,14 @@ var DashboardHTML = `<!DOCTYPE html>
   .raw-box {
     background: #050811; border: 1px solid #1E293B; border-radius: 6px; padding: 7px 9px;
     font-family: 'Courier New', monospace; font-size: 11.5px;
-    height: 135px; min-height: 85px; max-height: 680px;
-    overflow-y: auto; resize: vertical; direction: ltr; text-align: left;
+    height: 140px; min-height: 85px; max-height: 700px;
+    overflow-y: auto; overflow-x: auto; resize: vertical; direction: ltr; text-align: left;
   }
   .raw-line {
-    white-space: nowrap; overflow: hidden; text-overflow: ellipsis; padding: 2px 4px;
+    white-space: pre; width: max-content; min-width: 100%; padding: 2px 6px;
     border-radius: 4px; cursor: pointer; color: #7DD3FC; margin-bottom: 1px;
   }
+  body.wrap-lines .raw-line { white-space: pre-wrap; word-break: break-all; width: 100%; }
   .raw-line:hover { background: rgba(255,255,255,0.07); }
   .raw-line.crit { color: #FCA5A5; background: rgba(239,68,68,0.08); }
   .raw-line.warn { color: #FDE68A; background: rgba(245,158,11,0.06); }
@@ -85,15 +96,11 @@ var DashboardHTML = `<!DOCTYPE html>
   .port-tag { color: #E2E8F0; font-weight: 700; background: #1E293B; padding: 0 4px; border-radius: 3px; margin-right: 4px; }
   .corr-tag { color: #C084FC; font-weight: 700; margin-right: 4px; }
   .copy-btn {
-    float: right; font-size: 10px; background: #1E293B; color: #CBD5E1; border: none;
-    border-radius: 3px; padding: 0 5px; cursor: pointer; margin-left: 6px;
+    font-size: 10px; background: #1E293B; color: #CBD5E1; border: none;
+    border-radius: 3px; padding: 0 5px; cursor: pointer; margin-right: 6px;
   }
   .copy-btn:hover { background: var(--cyan); color: #000; }
 
-  .cp-right {
-    background: #0A0E19; border: 1px solid #1E293B; border-radius: 8px; padding: 9px 12px;
-    display: flex; flex-direction: column; justify-content: space-between; font-size: 11.5px; line-height: 1.42;
-  }
   .stat-bar { display: flex; justify-content: space-between; flex-wrap: wrap; gap: 6px; border-bottom: 1px solid #1E293B; padding-bottom: 5px; margin-bottom: 4px; font-family: monospace; direction: ltr; }
   .avg-bar {
     background: #0F172A; border: 1px solid #1E293B; border-radius: 5px; padding: 5px 8px;
@@ -135,18 +142,20 @@ var DashboardHTML = `<!DOCTYPE html>
 <div class="wrap">
   <div id="viewMatrix">
     <div class="toolbar">
-      <div id="pingBanner"><strong>5-Ping Sync (1h Cache):</strong> Click Pause to measure 5 pings & freeze 150 pkts/window</div>
+      <div id="pingBanner"><strong>Drag ⇔ bar</strong> between columns to widen packet lines, or scroll horizontally inside any box</div>
       <div class="tool-group">
-        <input id="portFilter" class="ltr" placeholder="Ports (e.g. 443, 8443)" oninput="applyFilters()" style="width:185px;">
-        <button id="btnLockP" class="btn btn-pause" onclick="lockSnifferPorts()">🔒 Lock Sniffer Ports</button>
-        <button id="btnAllP" class="btn" onclick="unlockSnifferPorts()">🔓 All Ports</button>
-        <span id="lockPortBadge" class="ltr" style="font-size:11px;color:var(--emerald);font-weight:700;">[Sniffer: All Ports]</span>
+        <input id="portFilter" class="ltr" placeholder="Ports (e.g. 443, 8443)" oninput="applyFilters()" style="width:170px;">
+        <button id="btnLockP" class="btn btn-pause" onclick="lockSnifferPorts()">🔒 Lock Ports</button>
+        <button id="btnAllP" class="btn" onclick="unlockSnifferPorts()">🔓 All</button>
+        <span id="lockPortBadge" class="ltr" style="font-size:11px;color:var(--emerald);font-weight:700;">[All Ports]</span>
+        <button class="btn" onclick="resetCumulativeStats()" title="Reset cumulative session stealth counters">↺ Reset Stats</button>
+        <button class="btn" onclick="toggleWrapLines()" id="wrapBtn">↩ Wrap Lines</button>
         <label style="cursor:pointer;display:flex;align-items:center;gap:4px;color:#FCA5A5;font-weight:600;">
-          <input type="checkbox" id="leaksOnly" onchange="applyFilters()"> <span id="lblRedOnly">🔴 Red Only</span>
+          <input type="checkbox" id="leaksOnly" onchange="applyFilters()"> <span id="lblRedOnly">🔴 Red</span>
         </label>
-        <button class="btn" onclick="setAllHeights(125)">Compact</button>
-        <button class="btn" onclick="setAllHeights(240)">Tall</button>
-        <button class="btn" onclick="setAllHeights(420)">Max</button>
+        <button class="btn" onclick="setAllHeights(135)">Compact</button>
+        <button class="btn" onclick="setAllHeights(260)">Tall</button>
+        <button class="btn" onclick="setAllHeights(440)">Max</button>
       </div>
     </div>
     <div id="cpList"></div>
@@ -155,7 +164,7 @@ var DashboardHTML = `<!DOCTYPE html>
   <div id="viewServers" style="display:none;">
     <div class="srv-grid">
       <div class="card">
-        <h3 id="addSrvTitle" style="font-size:14px;margin-bottom:10px;color:var(--cyan)">+ Add Server 2 / Server 3 (SSH or Sentinel)</h3>
+        <h3 style="font-size:14px;margin-bottom:10px;color:var(--cyan)">+ Add Server 2 / Server 3 (SSH or Sentinel)</h3>
         <div class="form-row"><label>Server Label</label><input id="fName" placeholder="e.g. Server 2 (Relay/Exit)"></div>
         <div class="form-row"><label>Server Role</label>
           <select id="fRole"><option value="kharej">Server 2 / Server 3 (Transit/Exit CP4-CP6)</option><option value="iran">Main Server (Entry CP1-CP3)</option></select>
@@ -176,13 +185,35 @@ var DashboardHTML = `<!DOCTYPE html>
 </div>
 
 <script>
-let isPaused = false, selectedTag = '', lastData = null, lastNodeKey = '', domInitialized = false, lang = 'en';
+let isPaused = false, selectedTag = '', lastData = null, lastNodeKey = '', domInitialized = false, lang = 'en', isDraggingSplit = false;
 const scrollLocks = {};
+// Cumulative Session Tracker per Checkpoint so Stealth % stays rock-solid over time
+const cumStats = {};
+function initCum(id) {
+  if (!cumStats[id]) cumStats[id] = { maxSeq: 0, wSum: 0, bytes: 0, safe: 0, warn: 0, crit: 0, ema: -1 };
+  return cumStats[id];
+}
+function resetCumulativeStats() {
+  Object.keys(cumStats).forEach(k => delete cumStats[k]);
+  if (lastData) renderMatrix(lastData);
+}
+function toggleWrapLines() { document.body.classList.toggle('wrap-lines'); }
+
+// Horizontal Drag Splitter Logic (drag right side of any packet window left/right)
+document.addEventListener('mousemove', e => {
+  if (!isDraggingSplit) return;
+  const wrap = document.querySelector('.wrap').getBoundingClientRect();
+  let pct = ((e.clientX - wrap.left) / wrap.width) * 100;
+  if (document.body.classList.contains('rtl')) pct = ((wrap.right - e.clientX) / wrap.width) * 100;
+  pct = Math.max(32, Math.min(84, pct));
+  document.documentElement.style.setProperty('--left-col', pct.toFixed(1) + '%');
+});
+document.addEventListener('mouseup', () => { isDraggingSplit = false; });
 
 const faGuides = {
   1: { t: "پنجره ۱: کارت شبکه ورودی سرور اصلی (کلاینت ➔ <bdi>Main Server</bdi>)", z: "🚨 بررسی DPI در ورودی سرور اصلی", w: "بسته‌های دریافتی از کلاینت شما در ورود به سرور اصلی.", g: "🔵 خطوط آبی: فریم‌های استاندارد <bdi>TLS 1.3 (\\x17\\x03\\x03)</bdi>.", b: "🔴 خطوط قرمز: هدرهای رمزنگاری‌نشده یا جریان بدون هدر <bdi>TLS</bdi>." },
   2: { t: "پنجره ۲: هسته داخلی تانل در سرور اصلی (<bdi>Internal RAM</bdi>)", z: "🔒 غیرقابل دید برای DPI خارجی", w: "انتقال داخلی بسته‌ها در حافظه سرور اصلی پیش از ارسال به تانل.", g: "🔵 خطوط آبی: پردازش ایمن داخلی در حافظه رم سرور اصلی.", b: "بدون ریسک — ایزوله در داخل سرور اصلی." },
-  3: { t: "پنجره ۳: خروجی تانل مرزی (<bdi>Main Server ➔ Server 2</bdi>)", z: "🚨 حساس‌ترین نقطه: گیت‌وی مرزی (DPI)", w: "بسته‌های تانل در حال خروج از سرور اصلی به سمت سرور ۲.", g: "🔵 خطوط آبی: فریم‌های معتبر <bdi>TLS/WSS/Reality</bdi> با درصد مخفی‌سازی وزنی بالا.", b: "🔴 خطوط قرمز: پورت‌فوروارد خام یا متن آشکار قابل تشخیص توسط فایروال." },
+  3: { t: "پنجره ۳: خروجی تانل مرزی (<bdi>Main Server ➔ Server 2</bdi>)", z: "🚨 حساس‌ترین نقطه: گیت‌وی مرزی (DPI)", w: "بسته‌های تانل در حال خروج از سرور اصلی به سمت سرور ۲.", g: "🔵 خطوط آبی: فریم‌های معتبر <bdi>TLS/WSS/Reality</bdi> با درصد مخفی‌سازی پایدار.", b: "🔴 خطوط قرمز: پورت‌فوروارد خام یا متن آشکار قابل تشخیص توسط فایروال." },
   4: { t: "پنجره ۴: کارت شبکه ورودی سرور ۲ (<bdi>Main Server ➔ Server 2</bdi>)", z: "👁 لبه دیتاسنتر سرور ۲", w: "بسته‌های تانل که از سرور اصلی به کارت شبکه سرور ۲ می‌رسند.", g: "🔵 خطوط آبی منطبق با تگ‌های <bdi>[TAG:xxxx]</bdi> پنجره ۳ پس از تاخیر <bdi>+RTT/2</bdi>.", b: "🔴 خطوط قرمز یا حذف شدن بسته‌ها در مسیر مرزی." },
   5: { t: "پنجره ۵: هسته رمزگشایی داخلی سرور ۲ (<bdi>Server 2 RAM</bdi>)", z: "🔒 غیرقابل دید برای DPI (حافظه سرور ۲)", w: "جریان رمزگشایی‌شده در داخل سرور ۲ پیش از ارسال به اینترنت.", g: "🔵 خطوط آبی: پردازش داخلی ایمن در سرور ۲.", b: "بدون ریسک — داخل حافظه سرور ۲." },
   6: { t: "پنجره ۶: خروجی اینترنت آزاد (<bdi>Server 2 ➔ Target Web</bdi>)", z: "🌐 خروجی اینترنت مقصد", w: "ترافیک نهایی خروجی از سرور ۲ به سمت وب‌سایت‌های مقصد (<bdi>:443</bdi>).", g: "🔵 خطوط آبی: ارتباط استاندارد <bdi>HTTPS (\\x17\\x03\\x03)</bdi>.", b: "🔴 خطوط قرمز: ترافیک <bdi>HTTP (:80)</bdi> بدون رمزنگاری." }
@@ -190,16 +221,11 @@ const faGuides = {
 
 function toggleLang() {
   lang = (lang === 'en') ? 'fa' : 'en';
-  document.body.className = (lang === 'fa') ? 'rtl' : '';
+  document.body.classList.toggle('rtl', lang === 'fa');
   document.getElementById('tabMatrix').innerText = lang==='fa' ? 'ماتریس ۶ پنجره‌ای' : '6-Window Matrix';
-  document.getElementById('tabServers').innerText = lang==='fa' ? '🖧 مدیریت سرورها (Main / Server 2)' : '🖧 Servers & SSH Deploy';
+  document.getElementById('tabServers').innerText = lang==='fa' ? '🖧 مدیریت سرورها' : '🖧 Servers & SSH Deploy';
   document.getElementById('lblS1').innerText = lang==='fa' ? 'سرور اصلی:' : 'Main Server:';
   document.getElementById('lblS2').innerText = lang==='fa' ? '➔ سرور ۲ / ۳:' : '➔ Server 2 / 3:';
-  document.getElementById('btnStart').innerText = lang==='fa' ? '▶ شروع هر دو' : '▶ Start Both';
-  document.getElementById('btnStop').innerText = lang==='fa' ? '■ توقف هر دو' : '■ Stop Both';
-  document.getElementById('btnLockP').innerText = lang==='fa' ? '🔒 قفل اسنیفر روی پورت' : '🔒 Lock Sniffer Ports';
-  document.getElementById('btnAllP').innerText = lang==='fa' ? '🔓 همه پورت‌ها' : '🔓 All Ports';
-  document.getElementById('lblRedOnly').innerText = lang==='fa' ? '🔴 فقط خطوط قرمز' : '🔴 Red Only';
   if (lastData) renderMatrix(lastData);
 }
 
@@ -221,8 +247,8 @@ function copyLine(ev) {
 }
 function setAllHeights(px) { document.querySelectorAll('.raw-box').forEach(b => { b.style.height = px + 'px'; }); }
 function applyFilters() { if (lastData) renderMatrix(lastData); }
-async function lockSnifferPorts() { await fetch('api/ports?ports=' + encodeURIComponent(document.getElementById('portFilter').value.trim()), {method:'POST'}); pollState(); }
-async function unlockSnifferPorts() { document.getElementById('portFilter').value = ''; await fetch('api/ports?ports=', {method:'POST'}); pollState(); }
+async function lockSnifferPorts() { resetCumulativeStats(); await fetch('api/ports?ports=' + encodeURIComponent(document.getElementById('portFilter').value.trim()), {method:'POST'}); pollState(); }
+async function unlockSnifferPorts() { document.getElementById('portFilter').value = ''; resetCumulativeStats(); await fetch('api/ports?ports=', {method:'POST'}); pollState(); }
 function splitPort(addr) { if (!addr) return ['—','—']; const idx = addr.lastIndexOf(':'); return idx > -1 ? [addr.slice(0, idx), addr.slice(idx+1)] : [addr, '—']; }
 
 function onBoxScroll(cpId) {
@@ -253,6 +279,7 @@ function ensureSkeleton(guides) {
         '</div>' +
         '<div class="raw-box" id="box-' + g.id + '"></div>' +
       '</div>' +
+      '<div class="splitter" onmousedown="isDraggingSplit=true" title="Drag left/right to resize packet window width">⋮</div>' +
       '<div class="cp-right" id="right-' + g.id + '"></div>' +
     '</div>'
   ).join('');
@@ -305,7 +332,7 @@ function renderMatrix(d) {
 
   const lp = d.locked_ports || [];
   const lBadge = document.getElementById('lockPortBadge');
-  lBadge.innerText = lp.length ? ('[🔒 Ports: ' + lp.join(', ') + ']') : '[Sniffer: All Ports]';
+  lBadge.innerText = lp.length ? ('[🔒 Ports: ' + lp.join(', ') + ']') : '[All Ports]';
   lBadge.style.color = lp.length ? 'var(--amber)' : 'var(--emerald)';
 
   const rawTokens = (document.getElementById('portFilter').value || '').split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
@@ -314,6 +341,28 @@ function renderMatrix(d) {
   d.guides.forEach(g => {
     const fg = (lang === 'fa' && faGuides[g.id]) ? faGuides[g.id] : null;
     const allEvs = (d.checkpoints && d.checkpoints[g.id]) || [];
+    const cs = initCum(g.id);
+
+    // Feed new unique packets into cumulative session tracker
+    let winWSum = 0, winBytes = 0;
+    allEvs.forEach(e => {
+      const b = Math.max(1, e.length || 1);
+      winWSum += (e.dpi.stealth_score * b);
+      winBytes += b;
+      if (e.sequence_num > cs.maxSeq) {
+        cs.maxSeq = e.sequence_num;
+        cs.wSum += (e.dpi.stealth_score * b);
+        cs.bytes += b;
+        if (e.dpi.level === 'CRITICAL') cs.crit++;
+        else if (e.dpi.level === 'WARNING') cs.warn++;
+        else cs.safe++;
+      }
+    });
+    if (winBytes > 0) {
+      const winScore = winWSum / winBytes;
+      cs.ema = cs.ema < 0 ? winScore : (cs.ema * 0.90 + winScore * 0.10);
+    }
+
     const evs = allEvs.filter(e => {
       if (leaksOnly && e.dpi.level === 'OPTIMAL') return false;
       if (rawTokens.length > 0) {
@@ -323,37 +372,25 @@ function renderMatrix(d) {
       return true;
     });
 
-    const statList = evs.length ? evs : allEvs;
-    let safeCnt = 0, warnCnt = 0, critCnt = 0, sumStealth = 0, weightedSum = 0, totalBytes = 0;
-    statList.forEach(e => {
-      const b = Math.max(1, e.length || 1);
-      sumStealth += e.dpi.stealth_score;
-      weightedSum += (e.dpi.stealth_score * b);
-      totalBytes += b;
-      if (e.dpi.level === 'CRITICAL') critCnt++;
-      else if (e.dpi.level === 'WARNING') warnCnt++;
-      else safeCnt++;
-    });
-    const pktAvg = statList.length ? Math.round(sumStealth / statList.length) : 0;
-    const bwStealth = totalBytes > 0 ? Math.round(weightedSum / totalBytes) : 0;
-    const totalKB = (totalBytes / 1024).toFixed(1);
+    const sessionStealth = cs.bytes > 0 ? Math.round(cs.wSum / cs.bytes) : 0;
+    const smoothEma = cs.ema >= 0 ? Math.round(cs.ema) : sessionStealth;
+    const totalMB = cs.bytes >= 1048576 ? (cs.bytes / 1048576).toFixed(2) + ' MB' : (cs.bytes / 1024).toFixed(1) + ' KB';
 
     const last = evs.length ? evs[evs.length - 1] : (allEvs.length ? allEvs[allEvs.length - 1] : null);
     const isCrit = last && last.dpi.level === 'CRITICAL';
     const isWarn = last && last.dpi.level === 'WARNING';
     const protoColor = isCrit ? 'var(--crimson)' : (isWarn ? 'var(--amber)' : 'var(--cyan)');
-    const stealthColor = isCrit ? 'var(--crimson)' : (isWarn ? 'var(--amber)' : 'var(--emerald)');
-    const bwColor = bwStealth < 50 ? 'var(--crimson)' : (bwStealth < 80 ? 'var(--amber)' : 'var(--emerald)');
+    const bwColor = sessionStealth < 50 ? 'var(--crimson)' : (sessionStealth < 80 ? 'var(--amber)' : 'var(--emerald)');
     const sPort = last ? splitPort(last.src_addr)[1] : '—';
     const dPort = last ? splitPort(last.dst_addr)[1] : '—';
 
     document.getElementById('row-' + g.id).className = 'cp-row ' + (isCrit ? 'critical' : (isWarn ? 'warning' : ''));
-    document.getElementById('title-' + g.id).innerHTML = (fg ? fg.t : g.title) + ' <bdi>(' + evs.length + '/' + allEvs.length + ' pkts | ' + totalKB + ' KB)</bdi>';
+    document.getElementById('title-' + g.id).innerHTML = (fg ? fg.t : g.title) + ' <bdi>(' + evs.length + ' win | ' + totalMB + ' total)</bdi>';
     document.getElementById('zone-' + g.id).innerHTML = fg ? fg.z : g.dpi_zone;
     document.getElementById('srv-' + g.id).innerText = getServerLabel(d, g.server_role);
 
     const box = document.getElementById('box-' + g.id);
-    const prevTop = box.scrollTop;
+    const prevTop = box.scrollTop, prevLeft = box.scrollLeft;
     const isLocked = (scrollLocks[g.id] || 0) > Date.now();
 
     box.innerHTML = evs.length ? evs.map(e => {
@@ -368,6 +405,7 @@ function renderMatrix(d) {
 
     if (d.capturing && !isPaused && !isLocked) box.scrollTop = box.scrollHeight;
     else box.scrollTop = prevTop;
+    box.scrollLeft = prevLeft;
 
     const lblWhat = lang==='fa' ? '👁 آنچه می‌بینید:' : '👁 What you see:';
     const lblGood = lang==='fa' ? '✓ ایمن (آبی):' : '✓ Safe (Blue):';
@@ -379,11 +417,10 @@ function renderMatrix(d) {
           '<span>Proto: <strong style="color:' + protoColor + '">' + (last ? last.protocol : '—') + '</strong></span>' +
           '<span>Ports: <strong style="color:#FFF">' + sPort + ' ➔ ' + dPort + '</strong></span>' +
           '<span>Entropy: <strong>' + (last ? last.dpi.shannon_entropy.toFixed(2) + '/8' : '—') + '</strong></span>' +
-          '<span>Last Pkt: <strong style="color:' + stealthColor + '">' + (last ? last.dpi.stealth_score + '%' : '—') + '</strong></span>' +
         '</div>' +
         '<div class="avg-bar">' +
-          '<span><strong>Byte-Weighted Stealth:</strong> <strong style="color:' + bwColor + ';font-size:12px;">' + (statList.length ? bwStealth + '%' : '—') + '</strong> <span style="color:var(--muted)">(Pkt Avg: ' + pktAvg + '%)</span></span>' +
-          '<span><span style="color:#7DD3FC">🔵 ' + safeCnt + '</span> / <span style="color:#FDE68A">🟡 ' + warnCnt + '</span> / <span style="color:#FCA5A5">🔴 ' + critCnt + '</span> (' + totalKB + ' KB)</span>' +
+          '<span><strong>Session Stealth:</strong> <strong style="color:' + bwColor + ';font-size:13px;">' + (cs.bytes ? sessionStealth + '%' : '—') + '</strong> <span style="color:var(--muted)">(Live EMA: ' + (cs.bytes ? smoothEma + '%' : '—') + ')</span></span>' +
+          '<span><span style="color:#7DD3FC">🔵 ' + cs.safe + '</span> / <span style="color:#FDE68A">🟡 ' + cs.warn + '</span> / <span style="color:#FCA5A5">🔴 ' + cs.crit + '</span> (' + totalMB + ')</span>' +
         '</div>' +
         '<div style="color:var(--muted)"><strong>' + lblWhat + '</strong> ' + (fg ? fg.w : g.what_you_see) + '</div>' +
         '<div style="color:#6EE7B7"><strong>' + lblGood + '</strong> ' + (fg ? fg.g : g.good_for_dpi) + '</div>' +
@@ -397,10 +434,7 @@ function renderNodes(nodes, activeS1, activeS2) {
   const key = nodes.map(n => n.id).join(',');
   if (key !== lastNodeKey) {
     lastNodeKey = key;
-    const opts = nodes.map((n, idx) => {
-      const cleanName = n.id === 'local-s1' ? 'Main Server (Local Hub)' : n.name;
-      return '<option value="'+n.id+'">'+cleanName+' ('+n.host+')</option>';
-    }).join('');
+    const opts = nodes.map(n => '<option value="'+n.id+'">'+(n.id==='local-s1'?'Main Server (Local Hub)':n.name)+' ('+n.host+')</option>').join('');
     document.getElementById('s1Select').innerHTML = opts;
     document.getElementById('s2Select').innerHTML = opts;
   }
