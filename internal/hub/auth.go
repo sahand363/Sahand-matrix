@@ -4,10 +4,8 @@ import (
 	"crypto/rand"
 	"crypto/subtle"
 	"encoding/hex"
-	"encoding/json"
 	"fmt"
 	"math/big"
-	"net"
 	"net/http"
 	"net/url"
 	"os/exec"
@@ -22,21 +20,19 @@ type captchaChallenge struct {
 	expires time.Time
 }
 
-// AuthWatchdog manages HTML Login + Math Captcha, 1h Session Cookies, M2M Token Auth,
-// Single-Flight Update Locking, and 10m/1h Auto-Stop Timers.
+// AuthWatchdog manages HTML Login + Math Captcha, 1h Session Cookies, Update Locking, and 10m/1h Auto-Stop Timers.
 type AuthWatchdog struct {
 	mu           sync.Mutex
 	user         string
 	pass         string
-	token        string
-	cookieName   string
-	sessions     map[string]time.Time // session token -> 1h expiry
+	sessions     map[string]time.Time // token -> 1h expiry
 	captchas     map[string]captchaChallenge
 	failCount    map[string]int
 	lockUntil    map[string]time.Time
 	stopAt10m    time.Time
 	stopAt1h     time.Time
 	didStop10m   bool
+	updateMu     sync.Mutex
 	updating     bool
 	onAutoStop   func(reason string)
 	onSessionEnd func()
@@ -46,7 +42,6 @@ func NewAuthWatchdog(user, pass string, onAutoStop func(string), onSessionEnd fu
 	aw := &AuthWatchdog{
 		user:         strings.TrimSpace(user),
 		pass:         strings.TrimSpace(pass),
-		cookieName:   "sahand_session",
 		sessions:     make(map[string]time.Time),
 		captchas:     make(map[string]captchaChallenge),
 		failCount:    make(map[string]int),
@@ -59,22 +54,6 @@ func NewAuthWatchdog(user, pass string, onAutoStop func(string), onSessionEnd fu
 	}
 	go aw.watchdogLoop()
 	return aw
-}
-
-// SetSharedToken configures the secret token required for Machine-to-Machine (M2M) authentication.
-func (aw *AuthWatchdog) SetSharedToken(token string) {
-	aw.mu.Lock()
-	defer aw.mu.Unlock()
-	aw.token = strings.TrimSpace(token)
-}
-
-// SetCookieName overrides the session cookie name (e.g., for Sentinel nodes).
-func (aw *AuthWatchdog) SetCookieName(name string) {
-	aw.mu.Lock()
-	defer aw.mu.Unlock()
-	if strings.TrimSpace(name) != "" {
-		aw.cookieName = strings.TrimSpace(name)
-	}
 }
 
 func (aw *AuthWatchdog) ArmLoginTimers() {
@@ -133,53 +112,10 @@ func (aw *AuthWatchdog) watchdogLoop() {
 	}
 }
 
-// HasM2MHeader reports whether the request attempts token-based authentication.
-func HasM2MHeader(r *http.Request) bool {
-	if _, ok := r.Header["X-Sahand-Token"]; ok {
-		return true
-	}
-	if _, ok := r.Header["Authorization"]; ok {
-		return true
-	}
-	if r.URL != nil && r.URL.Query().Has("token") {
-		return true
-	}
-	return false
-}
-
-// ValidateM2MToken performs fail-closed, constant-time validation of the shared machine token.
-// It never inspects browser cookies.
-func (aw *AuthWatchdog) ValidateM2MToken(r *http.Request) bool {
-	aw.mu.Lock()
-	expected := aw.token
-	aw.mu.Unlock()
-
-	if expected == "" {
-		return false
-	}
-
-	provided := strings.TrimSpace(r.Header.Get("X-Sahand-Token"))
-	if provided == "" {
-		authHdr := strings.TrimSpace(r.Header.Get("Authorization"))
-		if len(authHdr) > 7 && strings.EqualFold(authHdr[:7], "Bearer ") {
-			provided = strings.TrimSpace(authHdr[7:])
-		}
-	}
-	if provided == "" {
-		return false
-	}
-	return subtle.ConstantTimeCompare([]byte(provided), []byte(expected)) == 1
-}
-
-// IsAuthenticated verifies if the request carries a valid, unexpired browser session cookie.
-// It fails closed and never accepts M2M tokens.
+// IsAuthenticated checks for an active, unexpired browser session cookie (fails closed).
 func (aw *AuthWatchdog) IsAuthenticated(r *http.Request) bool {
-	aw.mu.Lock()
-	cName := aw.cookieName
-	aw.mu.Unlock()
-
-	c, err := r.Cookie(cName)
-	if err != nil || strings.TrimSpace(c.Value) == "" {
+	c, err := r.Cookie("sahand_session")
+	if err != nil || c.Value == "" {
 		return false
 	}
 	aw.mu.Lock()
@@ -192,20 +128,32 @@ func (aw *AuthWatchdog) IsAuthenticated(r *http.Request) bool {
 	return true
 }
 
-// GuardUI protects the HTML dashboard. In passwordless mode (user/pass blank), it issues
-// an HttpOnly session cookie upon visiting the UI path so subsequent API calls are authenticated.
+func (aw *AuthWatchdog) issueSessionCookie(w http.ResponseWriter, r *http.Request) {
+	tok := randomHex(20)
+	aw.mu.Lock()
+	aw.sessions[tok] = time.Now().Add(1 * time.Hour)
+	aw.mu.Unlock()
+
+	http.SetCookie(w, &http.Cookie{
+		Name:     "sahand_session",
+		Value:    tok,
+		Path:     "/",
+		HttpOnly: true,
+		Secure:   r.TLS != nil,
+		SameSite: http.SameSiteLaxMode,
+		MaxAge:   3600,
+	})
+}
+
 func (aw *AuthWatchdog) GuardUI(baseRoute string, next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if aw.IsAuthenticated(r) {
 			next(w, r)
 			return
 		}
-		aw.mu.Lock()
-		passwordless := aw.user == "" || aw.pass == ""
-		aw.mu.Unlock()
-
-		if passwordless {
-			aw.issueNewSession(w, r)
+		if aw.user == "" || aw.pass == "" {
+			aw.ArmLoginTimers()
+			aw.issueSessionCookie(w, r)
 			next(w, r)
 			return
 		}
@@ -213,110 +161,78 @@ func (aw *AuthWatchdog) GuardUI(baseRoute string, next http.HandlerFunc) http.Ha
 	}
 }
 
-// GuardSessionAPI enforces browser session authentication exclusively (rejects M2M tokens).
-func (aw *AuthWatchdog) GuardSessionAPI(next http.HandlerFunc) http.HandlerFunc {
+func (aw *AuthWatchdog) GuardAPI(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if HasM2MHeader(r) || !aw.IsAuthenticated(r) {
-			writeJSONError(w, http.StatusUnauthorized, "unauthorized")
+		if !aw.IsAuthenticated(r) {
+			w.Header().Set("Content-Type", "application/json; charset=utf-8")
+			w.WriteHeader(http.StatusUnauthorized)
+			_, _ = w.Write([]byte(`{"error":"unauthorized"}`))
 			return
 		}
 		next(w, r)
 	}
 }
 
-// GuardM2M enforces machine-to-machine token authentication exclusively (rejects browser cookies).
-func (aw *AuthWatchdog) GuardM2M(next http.HandlerFunc) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		if !aw.ValidateM2MToken(r) {
-			writeJSONError(w, http.StatusUnauthorized, "unauthorized")
-			return
-		}
-		next(w, r)
+// HandleUpdate enforces POST-only, valid session auth, same-origin check, and single-flight concurrency lock.
+func (aw *AuthWatchdog) HandleUpdate(w http.ResponseWriter, r *http.Request, updateFn func()) {
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodPost)
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		_, _ = w.Write([]byte(`{"error":"method_not_allowed"}`))
+		return
 	}
-}
-
-// GuardSentinelAPI separates M2M requests (carrying token headers) from browser session requests
-// when the Sentinel UI is mounted at root "/".
-func (aw *AuthWatchdog) GuardSentinelAPI(allowBrowserSession bool, next http.HandlerFunc) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		if HasM2MHeader(r) {
-			if !aw.ValidateM2MToken(r) {
-				writeJSONError(w, http.StatusUnauthorized, "unauthorized")
-				return
-			}
-			next(w, r)
-			return
-		}
-		if allowBrowserSession && aw.IsAuthenticated(r) {
-			next(w, r)
-			return
-		}
-		writeJSONError(w, http.StatusUnauthorized, "unauthorized")
+	if !aw.IsAuthenticated(r) {
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = w.Write([]byte(`{"error":"unauthorized"}`))
+		return
 	}
-}
+	if orig := r.Header.Get("Origin"); orig != "" && !IsSameOrigin(orig, r.Host) {
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = w.Write([]byte(`{"error":"forbidden_origin"}`))
+		return
+	}
 
-// GuardUpdate enforces POST-only execution, strict authentication, and single-flight concurrency locking.
-func (aw *AuthWatchdog) GuardUpdate(runUpdate func()) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			w.Header().Set("Allow", http.MethodPost)
-			writeJSONError(w, http.StatusMethodNotAllowed, "method_not_allowed")
-			return
-		}
+	aw.updateMu.Lock()
+	if aw.updating {
+		aw.updateMu.Unlock()
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		w.WriteHeader(http.StatusConflict)
+		_, _ = w.Write([]byte(`{"error":"update_in_progress"}`))
+		return
+	}
+	aw.updating = true
+	aw.updateMu.Unlock()
 
-		authed := false
-		if HasM2MHeader(r) {
-			authed = aw.ValidateM2MToken(r)
-		} else {
-			authed = aw.IsAuthenticated(r)
-		}
-		if !authed {
-			writeJSONError(w, http.StatusUnauthorized, "unauthorized")
-			return
-		}
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte(`{"status":"updating"}`))
 
-		if origin := r.Header.Get("Origin"); origin != "" && ! isSameOrigin(origin, r) {
-			writeJSONError(w, http.StatusForbidden, "forbidden_origin")
-			return
-		}
-
-		aw.mu.Lock()
-		if aw.updating {
-			aw.mu.Unlock()
-			writeJSONError(w, http.StatusConflict, "update_in_progress")
-			return
-		}
-		aw.updating = true
-		aw.mu.Unlock()
-
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
-		_ = json.NewEncoder(w).Encode(map[string]any{"status": "updating"})
-
-		go func() {
-			defer func() {
-				aw.mu.Lock()
-				aw.updating = false
-				aw.mu.Unlock()
-			}()
-			if runUpdate != nil {
-				runUpdate()
-			}
+	go func() {
+		defer func() {
+			time.Sleep(2 * time.Second)
+			aw.updateMu.Lock()
+			aw.updating = false
+			aw.updateMu.Unlock()
 		}()
-	}
+		if updateFn != nil {
+			updateFn()
+		}
+	}()
 }
 
-// CORSMiddleware removes wildcard '*' CORS and restricts cross-origin headers to same-origin requests.
+// CORSMiddleware removes wildcard CORS and permits only same-origin requests.
 func (aw *AuthWatchdog) CORSMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		origin := r.Header.Get("Origin")
 		if origin != "" {
-			if isSameOrigin(origin, r) {
+			if IsSameOrigin(origin, r.Host) {
 				w.Header().Set("Access-Control-Allow-Origin", origin)
 				w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
 				w.Header().Set("Access-Control-Allow-Headers", "Content-Type, X-Sahand-Token, Authorization")
 				w.Header().Set("Access-Control-Allow-Credentials", "true")
-				w.Header().Set("Vary", "Origin")
 			} else if r.Method == http.MethodOptions {
 				w.WriteHeader(http.StatusForbidden)
 				return
@@ -330,51 +246,19 @@ func (aw *AuthWatchdog) CORSMiddleware(next http.Handler) http.Handler {
 	})
 }
 
-func isSameOrigin(origin string, r *http.Request) bool {
+func IsSameOrigin(origin, reqHost string) bool {
 	u, err := url.Parse(origin)
-	if err != nil || u.Host == "" {
+	if err != nil {
 		return false
 	}
-	return strings.EqualFold(u.Host, r.Host) || strings.EqualFold(u.Hostname(), strings.Split(r.Host, ":")[0])
-}
-
-func (aw *AuthWatchdog) issueNewSession(w http.ResponseWriter, r *http.Request) {
-	tok := randomHex(20)
-	aw.mu.Lock()
-	cName := aw.cookieName
-	aw.sessions[tok] = time.Now().Add(1 * time.Hour)
-	aw.mu.Unlock()
-
-	aw.ArmLoginTimers()
-	http.SetCookie(w, &http.Cookie{
-		Name:     cName,
-		Value:    tok,
-		Path:     "/",
-		HttpOnly: true,
-		Secure:   isHTTPSRequest(r),
-		SameSite: http.SameSiteLaxMode,
-		MaxAge:   3600,
-	})
-}
-
-func isHTTPSRequest(r *http.Request) bool {
-	if r.TLS != nil {
-		return true
-	}
-	host, _, err := net.SplitHostPort(r.RemoteAddr)
-	if err != nil {
-		host = r.RemoteAddr
-	}
-	if host == "127.0.0.1" || host == "::1" {
-		return strings.EqualFold(r.Header.Get("X-Forwarded-Proto"), "https")
-	}
-	return false
+	origHost := u.Hostname()
+	targetHost := strings.Split(reqHost, ":")[0]
+	return strings.EqualFold(origHost, targetHost) || origHost == "127.0.0.1" || strings.EqualFold(origHost, "localhost")
 }
 
 func (aw *AuthWatchdog) HandleLogin(w http.ResponseWriter, r *http.Request, baseRoute string) {
-	target := strings.TrimRight(baseRoute, "/") + "/"
 	if r.Method != http.MethodPost {
-		http.Redirect(w, r, target, http.StatusFound)
+		http.Redirect(w, r, baseRoute+"/", http.StatusFound)
 		return
 	}
 	_ = r.ParseForm()
@@ -418,16 +302,13 @@ func (aw *AuthWatchdog) HandleLogin(w http.ResponseWriter, r *http.Request, base
 	delete(aw.failCount, ip)
 	aw.mu.Unlock()
 
-	aw.issueNewSession(w, r)
-	http.Redirect(w, r, target, http.StatusFound)
+	aw.ArmLoginTimers()
+	aw.issueSessionCookie(w, r)
+	http.Redirect(w, r, baseRoute+"/", http.StatusFound)
 }
 
 func (aw *AuthWatchdog) HandleLogout(w http.ResponseWriter, r *http.Request, baseRoute string) {
-	aw.mu.Lock()
-	cName := aw.cookieName
-	aw.mu.Unlock()
-
-	if c, err := r.Cookie(cName); err == nil {
+	if c, err := r.Cookie("sahand_session"); err == nil {
 		aw.mu.Lock()
 		delete(aw.sessions, c.Value)
 		aw.mu.Unlock()
@@ -438,16 +319,8 @@ func (aw *AuthWatchdog) HandleLogout(w http.ResponseWriter, r *http.Request, bas
 	if aw.onSessionEnd != nil {
 		aw.onSessionEnd()
 	}
-	http.SetCookie(w, &http.Cookie{
-		Name:     cName,
-		Value:    "",
-		Path:     "/",
-		HttpOnly: true,
-		Secure:   isHTTPSRequest(r),
-		SameSite: http.SameSiteLaxMode,
-		MaxAge:   -1,
-	})
-	http.Redirect(w, r, strings.TrimRight(baseRoute, "/")+"/", http.StatusFound)
+	http.SetCookie(w, &http.Cookie{Name: "sahand_session", Value: "", Path: "/", HttpOnly: true, Secure: r.TLS != nil, SameSite: http.SameSiteLaxMode, MaxAge: -1})
+	http.Redirect(w, r, baseRoute+"/", http.StatusFound)
 }
 
 func (aw *AuthWatchdog) ServeLoginPage(w http.ResponseWriter, _ *http.Request, baseRoute, errMsg string) {
@@ -461,27 +334,16 @@ func (aw *AuthWatchdog) ServeLoginPage(w http.ResponseWriter, _ *http.Request, b
 	if errMsg != "" {
 		errBox = `<div style="background:rgba(239,68,68,0.18);border:1px solid #EF4444;color:#FCA5A5;padding:8px 10px;border-radius:6px;margin-bottom:12px;font-size:12px;">⚠ ` + errMsg + `</div>`
 	}
-	loginPath := strings.TrimRight(baseRoute, "/") + "/login"
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	_, _ = fmt.Fprintf(w, loginPageTemplate, errBox, loginPath, cid, a, b)
+	_, _ = fmt.Fprintf(w, loginPageTemplate, errBox, baseRoute+"/login", cid, a, b)
 }
 
-// RunSelfUpdate executes the synchronous update process (called inside GuardUpdate's single-flight lock).
-func RunSelfUpdate() {
-	time.Sleep(400 * time.Millisecond)
-	script := `export PATH=$PATH:/usr/local/go/bin; TMP=/tmp/sahand-upd-$$; git clone --depth 1 https://github.com/sahand363/Sahand-matrix.git $TMP && cd$TMP && go mod tidy && CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o /usr/local/bin/sahand-hub ./cmd/sahand-hub && CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o /usr/local/bin/sahand-agent ./cmd/sahand-agent && cp -f $TMP/scripts/setup.sh /usr/local/bin/sahand-menu && chmod +x /usr/local/bin/sahand-hub /usr/local/bin/sahand-agent /usr/local/bin/sahand-menu && rm -rf$TMP && (systemctl restart sahand-hub sahand-agent 2>/dev/null || true)`
-	_ = exec.Command("bash", "-c", script).Run()
-}
-
-// TriggerSelfUpdate preserves backward compatibility for callers expecting an async helper.
 func TriggerSelfUpdate() {
-	go RunSelfUpdate()
-}
-
-func writeJSONError(w http.ResponseWriter, code int, msg string) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(code)
-	_ = json.NewEncoder(w).Encode(map[string]any{"error": msg})
+	go func() {
+		time.Sleep(400 * time.Millisecond)
+		script := `export PATH=$PATH:/usr/local/go/bin; TMP=/tmp/sahand-upd-$$; git clone --depth 1 https://github.com/sahand363/Sahand-matrix.git $TMP && cd $TMP && go mod tidy && CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o /usr/local/bin/sahand-hub ./cmd/sahand-hub && CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o /usr/local/bin/sahand-agent ./cmd/sahand-agent && cp -f $TMP/scripts/setup.sh /usr/local/bin/sahand-menu && chmod +x /usr/local/bin/sahand-hub /usr/local/bin/sahand-agent /usr/local/bin/sahand-menu && rm -rf $TMP && (systemctl restart sahand-hub sahand-agent 2>/dev/null || true)`
+		_ = exec.Command("bash", "-c", script).Run()
+	}()
 }
 
 func randomHex(n int) string {
