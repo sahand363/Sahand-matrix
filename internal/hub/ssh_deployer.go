@@ -210,7 +210,6 @@ cat >/etc/systemd/system/sahand-agent.service <<EOF
 Description=Sahand Matrix Sentinel Agent
 After=network.target
 [Service]
-// Replace lines 206-210 in internal/hub/ssh_deployer.go with:
 ExecStart=/usr/local/bin/sahand-agent -role %s -id %s -peer %s -token %s -listen :9444
 Restart=always
 [Install]
