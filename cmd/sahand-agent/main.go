@@ -1,19 +1,394 @@
 package main
 
 import (
+	"crypto/rand"
+	"crypto/subtle"
+	"encoding/hex"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
+	"math/big"
+	"net"
 	"net/http"
+	"net/url"
 	"os/exec"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"sahand-matrix/internal/agent"
 	"sahand-matrix/internal/analyzer"
-	"sahand-matrix/internal/hub"
 )
+
+type captchaChallenge struct {
+	answer  int
+	expires time.Time
+}
+
+type SentinelAuth struct {
+	mu        sync.Mutex
+	token     string
+	peerIP    string
+	user      string
+	pass      string
+	sessions  map[string]time.Time
+	captchas  map[string]captchaChallenge
+	failCount map[string]int
+	lockUntil map[string]time.Time
+	stop10m   time.Time
+	stop1h    time.Time
+	didStop   bool
+	updateMu  sync.Mutex
+	updating  bool
+	onStop    func()
+}
+
+func newSentinelAuth(token, peerIP, u, p string, onStop func()) *SentinelAuth {
+	sa := &SentinelAuth{
+		token:     strings.TrimSpace(token),
+		peerIP:    strings.TrimSpace(peerIP),
+		user:      strings.TrimSpace(u),
+		pass:      strings.TrimSpace(p),
+		sessions:  make(map[string]time.Time),
+		captchas:  make(map[string]captchaChallenge),
+		failCount: make(map[string]int),
+		lockUntil: make(map[string]time.Time),
+		onStop:    onStop,
+	}
+	if sa.user == "" || sa.pass == "" {
+		sa.Arm()
+	}
+	go sa.loop()
+	return sa
+}
+
+func (sa *SentinelAuth) Arm() {
+	sa.mu.Lock()
+	defer sa.mu.Unlock()
+	now := time.Now()
+	sa.stop10m = now.Add(10 * time.Minute)
+	sa.stop1h = now.Add(60 * time.Minute)
+	sa.didStop = false
+}
+
+func (sa *SentinelAuth) RemainingSeconds() int {
+	sa.mu.Lock()
+	defer sa.mu.Unlock()
+	now := time.Now()
+	if !sa.didStop && sa.stop10m.After(now) {
+		return int(sa.stop10m.Sub(now).Seconds())
+	}
+	if sa.stop1h.After(now) {
+		return int(sa.stop1h.Sub(now).Seconds())
+	}
+	return 0
+}
+
+func (sa *SentinelAuth) loop() {
+	for {
+		time.Sleep(2 * time.Second)
+		now := time.Now()
+		var fire bool
+		sa.mu.Lock()
+		if !sa.didStop && !sa.stop10m.IsZero() && now.After(sa.stop10m) {
+			sa.didStop = true
+			fire = true
+		}
+		if !sa.stop1h.IsZero() && now.After(sa.stop1h) {
+			sa.stop1h = time.Time{}
+			fire = true
+		}
+		for t, e := range sa.sessions {
+			if now.After(e) {
+				delete(sa.sessions, t)
+			}
+		}
+		sa.mu.Unlock()
+		if fire && sa.onStop != nil {
+			sa.onStop()
+		}
+	}
+}
+
+func hasTokenCredential(r *http.Request) (string, bool) {
+	if h := r.Header.Get("X-Sahand-Token"); h != "" {
+		return strings.TrimSpace(h), true
+	}
+	if auth := r.Header.Get("Authorization"); strings.HasPrefix(strings.ToLower(auth), "bearer ") {
+		return strings.TrimSpace(auth[7:]), true
+	}
+	if r.URL.Query().Has("token") {
+		return strings.TrimSpace(r.URL.Query().Get("token")), true
+	}
+	return "", false
+}
+
+// ValidateM2M validates machine-to-machine requests (never accepts browser cookies).
+func (sa *SentinelAuth) ValidateM2M(r *http.Request) bool {
+	provided, hasTok := hasTokenCredential(r)
+	if sa.token != "" {
+		if !hasTok || provided == "" {
+			return false
+		}
+		return subtle.ConstantTimeCompare([]byte(provided), []byte(sa.token)) == 1
+	}
+	if hasTok {
+		return false
+	}
+	if sa.peerIP != "" {
+		host, _, err := net.SplitHostPort(r.RemoteAddr)
+		if err != nil {
+			host = r.RemoteAddr
+		}
+		return host == sa.peerIP
+	}
+	return false
+}
+
+// IsBrowserSession validates browser session cookies (never accepts M2M tokens).
+func (sa *SentinelAuth) IsBrowserSession(r *http.Request) bool {
+	c, err := r.Cookie("sahand_sentinel_session")
+	if err != nil || c.Value == "" {
+		return false
+	}
+	sa.mu.Lock()
+	defer sa.mu.Unlock()
+	exp, ok := sa.sessions[c.Value]
+	if !ok || time.Now().After(exp) {
+		delete(sa.sessions, c.Value)
+		return false
+	}
+	return true
+}
+
+// GuardAPI enforces strict separation between M2M token auth and Browser session auth.
+func (sa *SentinelAuth) GuardAPI(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if _, hasTok := hasTokenCredential(r); hasTok {
+			if !sa.ValidateM2M(r) {
+				w.Header().Set("Content-Type", "application/json; charset=utf-8")
+				w.WriteHeader(http.StatusUnauthorized)
+				_, _ = w.Write([]byte(`{"error":"unauthorized_token"}`))
+				return
+			}
+			next(w, r)
+			return
+		}
+		if sa.IsBrowserSession(r) {
+			next(w, r)
+			return
+		}
+		if sa.ValidateM2M(r) {
+			next(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = w.Write([]byte(`{"error":"unauthorized"}`))
+	}
+}
+
+func (sa *SentinelAuth) HandleUpdate(w http.ResponseWriter, r *http.Request, updateFn func()) {
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodPost)
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		_, _ = w.Write([]byte(`{"error":"method_not_allowed"}`))
+		return
+	}
+
+	authed := false
+	if _, hasTok := hasTokenCredential(r); hasTok {
+		authed = sa.ValidateM2M(r)
+	} else {
+		authed = sa.IsBrowserSession(r)
+	}
+	if !authed {
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = w.Write([]byte(`{"error":"unauthorized"}`))
+		return
+	}
+	if orig := r.Header.Get("Origin"); orig != "" && !isSameOrigin(orig, r.Host) {
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = w.Write([]byte(`{"error":"forbidden_origin"}`))
+		return
+	}
+
+	sa.updateMu.Lock()
+	if sa.updating {
+		sa.updateMu.Unlock()
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		w.WriteHeader(http.StatusConflict)
+		_, _ = w.Write([]byte(`{"error":"update_in_progress"}`))
+		return
+	}
+	sa.updating = true
+	sa.updateMu.Unlock()
+
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte(`{"status":"updating"}`))
+
+	go func() {
+		defer func() {
+			time.Sleep(2 * time.Second)
+			sa.updateMu.Lock()
+			sa.updating = false
+			sa.updateMu.Unlock()
+		}()
+		if updateFn != nil {
+			updateFn()
+		}
+	}()
+}
+
+func (sa *SentinelAuth) CORSMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		origin := r.Header.Get("Origin")
+		if origin != "" {
+			if isSameOrigin(origin, r.Host) {
+				w.Header().Set("Access-Control-Allow-Origin", origin)
+				w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+				w.Header().Set("Access-Control-Allow-Headers", "Content-Type, X-Sahand-Token, Authorization")
+				w.Header().Set("Access-Control-Allow-Credentials", "true")
+			} else if r.Method == http.MethodOptions {
+				w.WriteHeader(http.StatusForbidden)
+				return
+			}
+		}
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func isSameOrigin(origin, reqHost string) bool {
+	u, err := url.Parse(origin)
+	if err != nil {
+		return false
+	}
+	origHost := u.Hostname()
+	targetHost := strings.Split(reqHost, ":")[0]
+	return strings.EqualFold(origHost, targetHost) || origHost == "127.0.0.1" || strings.EqualFold(origHost, "localhost")
+}
+
+func (sa *SentinelAuth) issueBrowserCookie(w http.ResponseWriter, r *http.Request) {
+	tok := randomHex(20)
+	sa.mu.Lock()
+	sa.sessions[tok] = time.Now().Add(1 * time.Hour)
+	sa.mu.Unlock()
+	http.SetCookie(w, &http.Cookie{
+		Name:     "sahand_sentinel_session",
+		Value:    tok,
+		Path:     "/",
+		HttpOnly: true,
+		Secure:   r.TLS != nil,
+		SameSite: http.SameSiteLaxMode,
+		MaxAge:   3600,
+	})
+}
+
+func (sa *SentinelAuth) GuardUI(base string, next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if sa.IsBrowserSession(r) {
+			next(w, r)
+			return
+		}
+		if sa.user == "" || sa.pass == "" {
+			sa.Arm()
+			sa.issueBrowserCookie(w, r)
+			next(w, r)
+			return
+		}
+		sa.serveLogin(w, r, base, "")
+	}
+}
+
+func (sa *SentinelAuth) HandleLogin(w http.ResponseWriter, r *http.Request, base string) {
+	if r.Method != http.MethodPost {
+		http.Redirect(w, r, base, http.StatusFound)
+		return
+	}
+	_ = r.ParseForm()
+	ip := strings.Split(r.RemoteAddr, ":")[0]
+
+	sa.mu.Lock()
+	if until, l := sa.lockUntil[ip]; l && time.Now().Before(until) {
+		sa.mu.Unlock()
+		sa.serveLogin(w, r, base, "Too many failed attempts. Locked for 5 minutes.")
+		return
+	}
+	cid := r.FormValue("cid")
+	ch, ok := sa.captchas[cid]
+	delete(sa.captchas, cid)
+	sa.mu.Unlock()
+
+	ans, err := strconv.Atoi(strings.TrimSpace(r.FormValue("captcha")))
+	if !ok || err != nil || time.Now().After(ch.expires) || ans != ch.answer {
+		sa.serveLogin(w, r, base, "Incorrect math answer or expired challenge.")
+		return
+	}
+
+	u := strings.TrimSpace(r.FormValue("username"))
+	p := strings.TrimSpace(r.FormValue("password"))
+	uOk := subtle.ConstantTimeCompare([]byte(u), []byte(sa.user)) == 1
+	pOk := subtle.ConstantTimeCompare([]byte(p), []byte(sa.pass)) == 1
+
+	if !uOk || !pOk {
+		sa.mu.Lock()
+		sa.failCount[ip]++
+		if sa.failCount[ip] >= 5 {
+			sa.lockUntil[ip] = time.Now().Add(5 * time.Minute)
+			sa.failCount[ip] = 0
+		}
+		sa.mu.Unlock()
+		sa.serveLogin(w, r, base, "Invalid username or password.")
+		return
+	}
+
+	sa.mu.Lock()
+	delete(sa.failCount, ip)
+	sa.mu.Unlock()
+
+	sa.Arm()
+	sa.issueBrowserCookie(w, r)
+	http.Redirect(w, r, base, http.StatusFound)
+}
+
+func (sa *SentinelAuth) HandleLogout(w http.ResponseWriter, r *http.Request, base string) {
+	if c, err := r.Cookie("sahand_sentinel_session"); err == nil {
+		sa.mu.Lock()
+		delete(sa.sessions, c.Value)
+		sa.mu.Unlock()
+	}
+	if sa.onStop != nil {
+		sa.onStop()
+	}
+	http.SetCookie(w, &http.Cookie{Name: "sahand_sentinel_session", Value: "", Path: "/", HttpOnly: true, Secure: r.TLS != nil, SameSite: http.SameSiteLaxMode, MaxAge: -1})
+	http.Redirect(w, r, base, http.StatusFound)
+}
+
+func (sa *SentinelAuth) serveLogin(w http.ResponseWriter, _ *http.Request, base, errMsg string) {
+	a, b := randInt(4, 19), randInt(3, 15)
+	cid := randomHex(10)
+	sa.mu.Lock()
+	sa.captchas[cid] = captchaChallenge{answer: a + b, expires: time.Now().Add(3 * time.Minute)}
+	sa.mu.Unlock()
+
+	errBox := ""
+	if errMsg != "" {
+		errBox = `<div style="background:rgba(239,68,68,0.18);border:1px solid #EF4444;color:#FCA5A5;padding:8px 10px;border-radius:6px;margin-bottom:12px;font-size:12px;">⚠ ` + errMsg + `</div>`
+	}
+	loginPath := strings.TrimRight(base, "/") + "/login"
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	_, _ = fmt.Fprintf(w, sentinelLoginTemplate, errBox, loginPath, cid, a, b)
+}
 
 func main() {
 	role := flag.String("role", "kharej", "Node role")
@@ -31,17 +406,9 @@ func main() {
 		_ = sniffer.RunCaptureLoop()
 	}()
 
-	auth := hub.NewAuthWatchdog(
-		*authUser,
-		*authPass,
-		func(reason string) {
-			log.Printf("[sahand-sentinel] Auto-stopping sniffer (%s)", reason)
-			sniffer.Stop()
-		},
-		nil,
-	)
-	auth.SetCookieName("sahand_sentinel_session")
-	auth.SetSharedToken(*token)
+	auth := newSentinelAuth(*token, *peerIP, *authUser, *authPass, func() {
+		sniffer.Stop()
+	})
 
 	uiPath := "/"
 	if s := strings.Trim(*secretPath, "/"); s != "" {
@@ -58,7 +425,7 @@ func main() {
 		})
 	}
 
-	handleControl := func(w http.ResponseWriter, r *http.Request) {
+	handleControl := auth.GuardAPI(func(w http.ResponseWriter, r *http.Request) {
 		action := r.URL.Query().Get("action")
 		if peer := r.URL.Query().Get("peer"); peer != "" {
 			sniffer.SetPeerIP(peer)
@@ -67,7 +434,7 @@ func main() {
 			sniffer.SetPortFilterCSV(r.URL.Query().Get("ports"))
 		}
 		if action == "start" {
-			auth.ArmLoginTimers()
+			auth.Arm()
 			sniffer.Start()
 		} else if action == "stop" {
 			sniffer.Stop()
@@ -79,9 +446,9 @@ func main() {
 			"role":         *role,
 			"locked_ports": sniffer.GetLockedPorts(),
 		})
-	}
+	})
 
-	handleSnapshot := func(w http.ResponseWriter, r *http.Request) {
+	handleSnapshot := auth.GuardAPI(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"server_id":    *serverID,
@@ -92,29 +459,27 @@ func main() {
 			"checkpoints":  sniffer.GetSnapshot(),
 			"guides":       analyzer.AllCheckpointGuides(),
 		})
-	}
+	})
 
-	runAgentUpdate := func() {
-		time.Sleep(300 * time.Millisecond)
-		cmd := `export PATH=$PATH:/usr/local/go/bin; TMP=/tmp/agent-upd-$$; git clone --depth 1 https://github.com/sahand363/Sahand-matrix.git $TMP && cd$TMP && go mod tidy && CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o /usr/local/bin/sahand-agent ./cmd/sahand-agent && rm -rf $TMP && systemctl restart sahand-agent`
-		_ = exec.Command("bash", "-c", cmd).Run()
+	handleUpdate := func(w http.ResponseWriter, r *http.Request) {
+		auth.HandleUpdate(w, r, func() {
+			time.Sleep(300 * time.Millisecond)
+			cmd := `export PATH=$PATH:/usr/local/go/bin; TMP=/tmp/agent-upd-$$; git clone --depth 1 https://github.com/sahand363/Sahand-matrix.git $TMP && cd $TMP && go mod tidy && CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o /usr/local/bin/sahand-agent ./cmd/sahand-agent && rm -rf $TMP && systemctl restart sahand-agent`
+			_ = exec.Command("bash", "-c", cmd).Run()
+		})
 	}
 
 	mux := http.NewServeMux()
-
-	// Root /api/* routes for Hub-to-Agent M2M polling (also allows browser session if UI is mounted at "/")
-	allowRootSession := (uiPath == "/")
 	mux.HandleFunc("/api/ping", handlePing)
-	mux.HandleFunc("/api/control", auth.GuardSentinelAPI(allowRootSession, handleControl))
-	mux.HandleFunc("/api/snapshot", auth.GuardSentinelAPI(allowRootSession, handleSnapshot))
-	mux.HandleFunc("/api/update", auth.GuardUpdate(runAgentUpdate))
+	mux.HandleFunc("/api/control", handleControl)
+	mux.HandleFunc("/api/snapshot", handleSnapshot)
+	mux.HandleFunc("/api/update", handleUpdate)
 
-	// When a secret UI path is configured, mount strictly separated browser-session API routes under uiPath
 	if uiPath != "/" {
 		mux.HandleFunc(uiPath+"api/ping", handlePing)
-		mux.HandleFunc(uiPath+"api/control", auth.GuardSessionAPI(handleControl))
-		mux.HandleFunc(uiPath+"api/snapshot", auth.GuardSessionAPI(handleSnapshot))
-		mux.HandleFunc(uiPath+"api/update", auth.GuardUpdate(runAgentUpdate))
+		mux.HandleFunc(uiPath+"api/control", handleControl)
+		mux.HandleFunc(uiPath+"api/snapshot", handleSnapshot)
+		mux.HandleFunc(uiPath+"api/update", handleUpdate)
 	}
 
 	mux.HandleFunc(uiPath+"login", func(w http.ResponseWriter, r *http.Request) {
@@ -131,6 +496,49 @@ func main() {
 	log.Printf("[sahand-sentinel] (%s) active on %s%s", *role, *listenAddr, uiPath)
 	log.Fatal(http.ListenAndServe(*listenAddr, auth.CORSMiddleware(mux)))
 }
+
+func randomHex(n int) string {
+	b := make([]byte, n)
+	_, _ = rand.Read(b)
+	return hex.EncodeToString(b)
+}
+
+func randInt(min, max int) int {
+	n, _ := rand.Int(rand.Reader, big.NewInt(int64(max-min+1)))
+	return int(n.Int64()) + min
+}
+
+const sentinelLoginTemplate = `<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8"><title>SAHAND SENTINEL // Security Gate</title>
+<style>
+  body { background:#0B0F19; color:#F8FAFC; font-family:'Inter',system-ui,sans-serif; display:flex; align-items:center; justify-content:center; min-height:100vh; margin:0; }
+  .card { background:#111827; border:1px solid #1E293B; border-top:3px solid #38BDF8; border-radius:12px; padding:26px 28px; width:100%%; max-width:380px; box-shadow:0 20px 40px rgba(0,0,0,0.5); }
+  h2 { font-size:16px; color:#38BDF8; margin:0 0 6px 0; display:flex; align-items:center; gap:8px; }
+  p { font-size:12px; color:#94A3B8; margin:0 0 18px 0; }
+  label { display:block; font-size:12px; color:#CBD5E1; margin-bottom:5px; font-weight:600; }
+  input { width:100%%; box-sizing:border-box; background:#070B14; border:1px solid #1E293B; color:#FFF; padding:9px 12px; border-radius:6px; font-size:13px; margin-bottom:14px; }
+  input:focus { outline:none; border-color:#38BDF8; }
+  .math-box { background:#0D1322; border:1px solid #38BDF8; border-radius:8px; padding:10px 12px; margin-bottom:16px; display:flex; align-items:center; justify-content:space-between; }
+  .btn { width:100%%; background:#10B981; color:#04130D; border:none; padding:10px; border-radius:6px; font-size:13px; font-weight:700; cursor:pointer; }
+  .btn:hover { filter:brightness(1.1); }
+</style></head><body>
+<div class="card">
+  <h2>❖ SAHAND SENTINEL</h2>
+  <p>Protected Node Diagnostic Lab (1h Session / 10m Auto-Stop)</p>
+  %s
+  <form method="POST" action="%s">
+    <input type="hidden" name="cid" value="%s">
+    <label>Username</label>
+    <input type="text" name="username" required autofocus placeholder="Enter username">
+    <label>Password</label>
+    <input type="password" name="password" required placeholder="••••••••">
+    <div class="math-box">
+      <span style="font-size:13px;font-weight:700;color:#7DD3FC;">Security Check: %d + %d = ?</span>
+      <input type="number" name="captcha" required placeholder="?" style="width:85px;margin:0;text-align:center;font-weight:700;">
+    </div>
+    <button class="btn" type="submit">🔓 Unlock Sentinel Node</button>
+  </form>
+</div></body></html>`
 
 const agentSentinelHTML = `<!DOCTYPE html>
 <html lang="en">
