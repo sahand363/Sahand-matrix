@@ -4,13 +4,13 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"log"
 	"net/http"
 	"net/url"
 	"os"
 	"strings"
 	"sync"
 	"time"
-	"log"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"sahand-matrix/internal/agent"
@@ -70,7 +70,7 @@ func runDaemonServer(port, secret, token, authUser, authPass string) {
 		activeS1:   "local-s1",
 		activeS2:   "local-s1",
 		lastRemote: make(map[models.CheckpointID][]models.PacketEvent),
-		token:      token,
+		token:      strings.TrimSpace(token),
 		httpClient: &http.Client{Timeout: 2500 * time.Millisecond},
 	}
 
@@ -86,6 +86,7 @@ func runDaemonServer(port, secret, token, authUser, authPass string) {
 			hc.nodeMgr.WipeSensitiveMemory()
 		},
 	)
+	hc.auth.SetSharedToken(hc.token)
 
 	go hc.pollRemoteLoop()
 
@@ -100,13 +101,9 @@ func runDaemonServer(port, secret, token, authUser, authPass string) {
 		hc.auth.HandleLogout(w, r, baseRoute)
 	})
 
-	mux.HandleFunc(baseRoute+"/api/update", hc.auth.GuardAPI(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]any{"status": "updating"})
-		hub.TriggerSelfUpdate()
-	}))
+	mux.HandleFunc(baseRoute+"/api/update", hc.auth.GuardUpdate(hub.RunSelfUpdate))
 
-	mux.HandleFunc(baseRoute+"/api/control", hc.auth.GuardAPI(func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc(baseRoute+"/api/control", hc.auth.GuardSessionAPI(func(w http.ResponseWriter, r *http.Request) {
 		action := r.URL.Query().Get("action")
 		if action == "start" {
 			hc.auth.ArmLoginTimers()
@@ -119,7 +116,7 @@ func runDaemonServer(port, secret, token, authUser, authPass string) {
 		_ = json.NewEncoder(w).Encode(map[string]any{"capturing": hc.localSniff.IsRunning()})
 	}))
 
-	mux.HandleFunc(baseRoute+"/api/ports", hc.auth.GuardAPI(func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc(baseRoute+"/api/ports", hc.auth.GuardSessionAPI(func(w http.ResponseWriter, r *http.Request) {
 		portsCSV := r.URL.Query().Get("ports")
 		locked := hc.localSniff.SetPortFilterCSV(portsCSV)
 		hc.mu.Lock()
@@ -130,7 +127,7 @@ func runDaemonServer(port, secret, token, authUser, authPass string) {
 		_ = json.NewEncoder(w).Encode(map[string]any{"locked_ports": locked})
 	}))
 
-	mux.HandleFunc(baseRoute+"/api/pair", hc.auth.GuardAPI(func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc(baseRoute+"/api/pair", hc.auth.GuardSessionAPI(func(w http.ResponseWriter, r *http.Request) {
 		hc.mu.Lock()
 		if s1 := r.URL.Query().Get("s1"); s1 != "" {
 			hc.activeS1 = s1
@@ -145,7 +142,7 @@ func runDaemonServer(port, secret, token, authUser, authPass string) {
 		w.WriteHeader(http.StatusOK)
 	}))
 
-	mux.HandleFunc(baseRoute+"/api/nodes/add", hc.auth.GuardAPI(func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc(baseRoute+"/api/nodes/add", hc.auth.GuardSessionAPI(func(w http.ResponseWriter, r *http.Request) {
 		var req struct {
 			Name     string `json:"name"`
 			Role     string `json:"role"`
@@ -171,7 +168,7 @@ func runDaemonServer(port, secret, token, authUser, authPass string) {
 		_ = json.NewEncoder(w).Encode(node)
 	}))
 
-	mux.HandleFunc(baseRoute+"/api/nodes/delete", hc.auth.GuardAPI(func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc(baseRoute+"/api/nodes/delete", hc.auth.GuardSessionAPI(func(w http.ResponseWriter, r *http.Request) {
 		id := r.URL.Query().Get("id")
 		hc.nodeMgr.DeleteNode(id)
 		hc.mu.Lock()
@@ -182,14 +179,14 @@ func runDaemonServer(port, secret, token, authUser, authPass string) {
 		w.WriteHeader(http.StatusOK)
 	}))
 
-	mux.HandleFunc(baseRoute+"/api/nodes/deploy", hc.auth.GuardAPI(func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc(baseRoute+"/api/nodes/deploy", hc.auth.GuardSessionAPI(func(w http.ResponseWriter, r *http.Request) {
 		id := r.URL.Query().Get("id")
 		hubHost := strings.Split(r.Host, ":")[0]
 		hc.nodeMgr.DeployAgentAsync(id, hubHost, hc.token)
 		w.WriteHeader(http.StatusOK)
 	}))
 
-	mux.HandleFunc(baseRoute+"/api/pause-burst", hc.auth.GuardAPI(func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc(baseRoute+"/api/pause-burst", hc.auth.GuardSessionAPI(func(w http.ResponseWriter, r *http.Request) {
 		targetHost := hc.getS2HostPort()
 		report := hc.syncEngine.GetOrMeasure5Pings(targetHost, hc.token, false)
 		hc.mu.Lock()
@@ -198,7 +195,7 @@ func runDaemonServer(port, secret, token, authUser, authPass string) {
 		hc.writeMergedState(w)
 	}))
 
-	mux.HandleFunc(baseRoute+"/api/state", hc.auth.GuardAPI(func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc(baseRoute+"/api/state", hc.auth.GuardSessionAPI(func(w http.ResponseWriter, r *http.Request) {
 		hc.writeMergedState(w)
 	}))
 
@@ -208,7 +205,7 @@ func runDaemonServer(port, secret, token, authUser, authPass string) {
 	}))
 
 	log.Printf("[sahand-hub] Main Server Lab active on :%s%s/", port, baseRoute)
-	log.Fatal(hub.ListenDualHTTPAndTLS("0.0.0.0:"+port, mux))
+	log.Fatal(hub.ListenDualHTTPAndTLS("0.0.0.0:"+port, hc.auth.CORSMiddleware(mux)))
 }
 
 func (hc *HubCoordinator) getS2HostPort() string {
@@ -228,7 +225,14 @@ func (hc *HubCoordinator) forwardRemoteQuery(query string) {
 		}
 		u := fmt.Sprintf("http://%s:%d/api/control?%s", n.Host, n.AgentPort, query)
 		go func(target string) {
-			resp, err := hc.httpClient.Get(target)
+			req, err := http.NewRequest(http.MethodGet, target, nil)
+			if err != nil {
+				return
+			}
+			if hc.token != "" {
+				req.Header.Set("X-Sahand-Token", hc.token)
+			}
+			resp, err := hc.httpClient.Do(req)
 			if err == nil {
 				_ = resp.Body.Close()
 			}
@@ -258,18 +262,27 @@ func (hc *HubCoordinator) pollRemoteLoop() {
 
 		if n, ok := hc.nodeMgr.GetNode(s2); ok && n.ID != "local-s1" {
 			u := fmt.Sprintf("http://%s:%d/api/snapshot", n.Host, n.AgentPort)
-			resp, err := hc.httpClient.Get(u)
+			req, err := http.NewRequest(http.MethodGet, u, nil)
+			if err != nil {
+				continue
+			}
+			if hc.token != "" {
+				req.Header.Set("X-Sahand-Token", hc.token)
+			}
+			resp, err := hc.httpClient.Do(req)
 			if err == nil {
-				var remoteSnap struct {
-					Checkpoints map[models.CheckpointID][]models.PacketEvent `json:"checkpoints"`
-				}
-				if json.NewDecoder(resp.Body).Decode(&remoteSnap) == nil && len(remoteSnap.Checkpoints) > 0 {
-					hc.nodeMgr.MarkNodeOnline(s2)
-					hc.mu.Lock()
-					for cpID, evs := range remoteSnap.Checkpoints {
-						hc.lastRemote[cpID] = evs
+				if resp.StatusCode == http.StatusOK {
+					var remoteSnap struct {
+						Checkpoints map[models.CheckpointID][]models.PacketEvent `json:"checkpoints"`
 					}
-					hc.mu.Unlock()
+					if json.NewDecoder(resp.Body).Decode(&remoteSnap) == nil && len(remoteSnap.Checkpoints) > 0 {
+						hc.nodeMgr.MarkNodeOnline(s2)
+						hc.mu.Lock()
+						for cpID, evs := range remoteSnap.Checkpoints {
+							hc.lastRemote[cpID] = evs
+						}
+						hc.mu.Unlock()
+					}
 				}
 				_ = resp.Body.Close()
 			}
