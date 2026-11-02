@@ -210,12 +210,13 @@ cat >/etc/systemd/system/sahand-agent.service <<EOF
 Description=Sahand Matrix Sentinel Agent
 After=network.target
 [Service]
-ExecStart=/usr/local/bin/sahand-agent -role %s -id %s -peer %s -listen :9444
+// Replace lines 206-210 in internal/hub/ssh_deployer.go with:
+ExecStart=/usr/local/bin/sahand-agent -role %s -id %s -peer %s -token %s -listen :9444
 Restart=always
 [Install]
 WantedBy=multi-user.target
 EOF
-systemctl daemon-reload && systemctl enable --now sahand-agent && systemctl restart sahand-agent`, node.Role, node.ID, hubIP)
+systemctl daemon-reload && systemctl enable --now sahand-agent && systemctl restart sahand-agent`, node.Role, node.ID, hubIP, sharedToken)
 
 		_ = sess.Run("bash -c '" + strings.ReplaceAll(cmd, "'", "'\\''") + "'")
 		_ = sess.Close()
